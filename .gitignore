@@ -1,0 +1,21 @@
+# Python cache & virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+env/
+
+# Auto-downloaded MediaPipe model bundles (re-downloaded automatically by realsense_d455_arm_tracker.py)
+*.task
+
+# Local machine path cache for copy_to_unity.bat
+unity_project_path.txt
+
+# OS & Editor files
+.DS_Store
+Thumbs.db
+.vs/
+.vscode/
+*.meta
+

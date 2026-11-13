@@ -44,9 +44,9 @@ Pimax_RealSense_ArmVR/
 Open **Command Prompt** or **PowerShell** on the new PC and run:
 ```powershell
 cd $HOME
-git clone <YOUR_GITHUB_REPO_URL> Pimax_RealSense_ArmVR
+git clone https://github.com/SantiagoMartinezHernandez/Pimax_RealSense_ArmVR.git
 ```
-*(Or extract the downloaded ZIP directly to `C:\Users\<YourUsername>\Pimax_RealSense_ArmVR`).*
+*(Or download the ZIP from https://github.com/SantiagoMartinezHernandez/Pimax_RealSense_ArmVR and extract it to `C:\Users\<YourUsername>\Pimax_RealSense_ArmVR`).*
 
 ---
 

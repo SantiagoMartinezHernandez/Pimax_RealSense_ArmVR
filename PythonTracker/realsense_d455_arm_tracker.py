@@ -65,12 +65,14 @@ def ensure_models():
         urllib.request.urlretrieve(HAND_MODEL_URL, HAND_MODEL_PATH)
 
 
-def start_realsense_with_best_profile(pipeline: rs.pipeline):
+def start_realsense_with_best_profile(pipeline: rs.pipeline, prefer_low_bandwidth: bool = False):
     ctx = rs.context()
     devices = ctx.query_devices()
     if len(devices) == 0:
         raise RuntimeError(
-            "No Intel RealSense device detected! Please check that the D455C USB cable is plugged in."
+            "No Intel RealSense device detected! Please check:\n"
+            "  1. The D455C USB cable is plugged into a USB 3.0 / Thunderbolt port.\n"
+            "  2. Windows Settings -> Privacy & security -> Camera -> 'Camera access' & 'Let desktop apps access your camera' are ON."
         )
 
     dev = devices[0]
@@ -80,17 +82,27 @@ def start_realsense_with_best_profile(pipeline: rs.pipeline):
 
     print(f"[RealSense] Found Device: {dev_name} (S/N: {serial}) on USB {usb_type}")
 
-    candidates = [
-        (640, 480, 640, 480, 60),
-        (848, 480, 848, 480, 60),
-        (640, 360, 640, 360, 60),
-        (640, 480, 640, 480, 30),
-        (848, 480, 848, 480, 30),
-        (848, 480, 1280, 720, 30),
-        (640, 360, 640, 360, 30),
-        (480, 270, 640, 480, 30),
-        (424, 240, 424, 240, 30),
-    ]
+    if prefer_low_bandwidth:
+        # Low USB-bandwidth profiles for mini-PCs (like ASUS ROG NUC) when sharing USB controller with Pimax VR
+        candidates = [
+            (640, 480, 640, 480, 30),
+            (640, 360, 640, 360, 30),
+            (480, 270, 640, 480, 30),
+            (424, 240, 424, 240, 30),
+            (640, 480, 640, 480, 15),
+        ]
+    else:
+        candidates = [
+            (640, 480, 640, 480, 60),
+            (848, 480, 848, 480, 60),
+            (640, 360, 640, 360, 60),
+            (640, 480, 640, 480, 30),
+            (848, 480, 848, 480, 30),
+            (848, 480, 1280, 720, 30),
+            (640, 360, 640, 360, 30),
+            (480, 270, 640, 480, 30),
+            (424, 240, 424, 240, 30),
+        ]
 
     for dw, dh, cw, ch, fps in candidates:
         cfg = rs.config()
@@ -98,7 +110,7 @@ def start_realsense_with_best_profile(pipeline: rs.pipeline):
         cfg.enable_stream(rs.stream.depth, dw, dh, rs.format.z16, fps)
         cfg.enable_stream(rs.stream.color, cw, ch, rs.format.bgr8, fps)
         if cfg.can_resolve(pipeline):
-            print(f"[RealSense] Selected fast stream profile: Depth {dw}x{dh} + Color {cw}x{ch} @ {fps} FPS")
+            print(f"[RealSense] Selected stream profile: Depth {dw}x{dh} + Color {cw}x{ch} @ {fps} FPS")
             return pipeline.start(cfg)
 
     cfg = rs.config()
@@ -106,6 +118,49 @@ def start_realsense_with_best_profile(pipeline: rs.pipeline):
     cfg.enable_stream(rs.stream.depth)
     cfg.enable_stream(rs.stream.color, rs.format.bgr8)
     return pipeline.start(cfg)
+
+
+def start_and_verify_first_frame(pipeline: rs.pipeline):
+    """
+    Starts the RealSense pipeline and waits up to 5000ms for the first frame.
+    If the USB controller on a NUC/Laptop drops frames at 60 FPS (due to sharing bandwidth
+    with a VR headset) or if the sensor is locked from a previous run, automatically
+    performs a hardware reset / falls back to a 30 FPS low-bandwidth USB profile!
+    """
+    for attempt in range(3):
+        low_bw = (attempt >= 1)
+        profile = start_realsense_with_best_profile(pipeline, prefer_low_bandwidth=low_bw)
+        try:
+            print("[RealSense] Waiting for sensor warmup and first frame (up to 5s)...")
+            frames = pipeline.wait_for_frames(timeout_ms=5000)
+            if frames:
+                print("[RealSense] First frame received successfully!")
+                return profile
+        except RuntimeError as e:
+            print(f"[RealSense] Warmup timeout on attempt {attempt + 1}: {e}")
+            try:
+                pipeline.stop()
+            except Exception:
+                pass
+
+            if attempt == 1:
+                print("[RealSense] Performing USB Hardware Reset on D455C sensor (waiting 4 seconds to re-enumerate)...")
+                try:
+                    ctx = rs.context()
+                    if len(ctx.query_devices()) > 0:
+                        ctx.query_devices()[0].hardware_reset()
+                        time.sleep(4.5)
+                except Exception as reset_err:
+                    print(f"[RealSense] Hardware reset warning: {reset_err}")
+            else:
+                print("[RealSense] Retrying with lower USB-bandwidth 30 FPS profile (ideal when sharing USB hub with Pimax VR)...")
+                time.sleep(1.0)
+
+    raise RuntimeError(
+        "RealSense D455C started but could not deliver frames over USB!\n"
+        "On ASUS ROG NUC: Move the D455C to the FRONT USB 3.2 port (or Thunderbolt USB-C port) "
+        "so it does not share the rear USB root hub with the Pimax Crystal headset."
+    )
 
 
 class KinematicArmState:
@@ -392,15 +447,17 @@ def run_realsense_pipeline():
     )
 
     pipeline = rs.pipeline()
-    profile = start_realsense_with_best_profile(pipeline)
+    profile = start_and_verify_first_frame(pipeline)
 
     depth_sensor = profile.get_device().first_depth_sensor()
     depth_scale = depth_sensor.get_depth_scale()
 
+    # Keep frames_queue_size >= 4 so librealsense's Depth+Color hardware syncer never drops
+    # a frame before its timestamp-matched partner arrives on Intel Core Ultra / ROG NUC USB controllers!
     for sensor in profile.get_device().query_sensors():
         if sensor.supports(rs.option.frames_queue_size):
             try:
-                sensor.set_option(rs.option.frames_queue_size, 1)
+                sensor.set_option(rs.option.frames_queue_size, 4)
             except Exception:
                 pass
 
@@ -423,7 +480,11 @@ def run_realsense_pipeline():
              vision.HandLandmarker.create_from_options(dual_hand_options) as dual_hand_landmarker:
 
             while True:
-                frames = pipeline.wait_for_frames(timeout_ms=1000)
+                try:
+                    frames = pipeline.wait_for_frames(timeout_ms=3000)
+                except RuntimeError as wait_err:
+                    print(f"[RealSense] Frame sync hiccup ({wait_err}), continuing...")
+                    continue
                 aligned_frames = align.process(frames)
 
                 depth_frame = aligned_frames.get_depth_frame()

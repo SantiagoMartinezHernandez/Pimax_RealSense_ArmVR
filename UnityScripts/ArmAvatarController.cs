@@ -705,39 +705,66 @@ namespace PsychophysicsVR.Tracking
                 return;
             }
 
-            // 1. Estimate temporal pipeline lag (camera frames lagging behind 1000Hz controller)
+            // 1. Estimate temporal pipeline lag ONLY if samples contain continuous dynamic motion.
+            //    For stationary 4-Stop Move & Hold samples (near-zero velocities), keep bestLag = 0!
             int bestLag = 0;
             float bestCorr = -1f;
             int n = samples.Count;
-            for (int lag = 0; lag <= 4; lag++)
+            float totalContinuousCtrlMotionSq = 0f;
+            for (int i = 0; i < n - 1; i++)
             {
-                float dot = 0f, normCtrl = 0f, normCam = 0f;
-                for (int i = 0; i < n - 1 - lag; i++)
+                float dtGap = samples[i + 1].Timestamp - samples[i].Timestamp;
+                if (dtGap > 0f && dtGap < 0.10f && samples[i].HasRight && samples[i + 1].HasRight)
                 {
-                    if (samples[i].HasRight && samples[i + 1].HasRight && samples[i + lag].HasRight && samples[i + 1 + lag].HasRight)
-                    {
-                        float vc = (samples[i + 1].RightCtrlWorldPos - samples[i].RightCtrlWorldPos).magnitude;
-                        float vm = (samples[i + 1 + lag].RightCamRelWrist - samples[i + lag].RightCamRelWrist).magnitude;
-                        dot += vc * vm;
-                        normCtrl += vc * vc;
-                        normCam += vm * vm;
-                    }
-                    if (samples[i].HasLeft && samples[i + 1].HasLeft && samples[i + lag].HasLeft && samples[i + 1 + lag].HasLeft)
-                    {
-                        float vc = (samples[i + 1].LeftCtrlWorldPos - samples[i].LeftCtrlWorldPos).magnitude;
-                        float vm = (samples[i + 1 + lag].LeftCamRelWrist - samples[i + lag].LeftCamRelWrist).magnitude;
-                        dot += vc * vm;
-                        normCtrl += vc * vc;
-                        normCam += vm * vm;
-                    }
+                    float d = (samples[i + 1].RightCtrlWorldPos - samples[i].RightCtrlWorldPos).magnitude;
+                    if (d < 0.06f) totalContinuousCtrlMotionSq += d * d;
                 }
-                if (normCtrl > 1e-5f && normCam > 1e-5f)
+                if (dtGap > 0f && dtGap < 0.10f && samples[i].HasLeft && samples[i + 1].HasLeft)
                 {
-                    float corr = dot / Mathf.Sqrt(normCtrl * normCam);
-                    if (corr > bestCorr)
+                    float d = (samples[i + 1].LeftCtrlWorldPos - samples[i].LeftCtrlWorldPos).magnitude;
+                    if (d < 0.06f) totalContinuousCtrlMotionSq += d * d;
+                }
+            }
+
+            if (totalContinuousCtrlMotionSq > 0.08f)
+            {
+                for (int lag = 0; lag <= 4; lag++)
+                {
+                    float dot = 0f, normCtrl = 0f, normCam = 0f;
+                    for (int i = 0; i < n - 1 - lag; i++)
                     {
-                        bestCorr = corr;
-                        bestLag = lag;
+                        if ((samples[i + 1].Timestamp - samples[i].Timestamp) > 0.10f) continue;
+                        if (samples[i].HasRight && samples[i + 1].HasRight && samples[i + lag].HasRight && samples[i + 1 + lag].HasRight)
+                        {
+                            float vc = (samples[i + 1].RightCtrlWorldPos - samples[i].RightCtrlWorldPos).magnitude;
+                            float vm = (samples[i + 1 + lag].RightCamRelWrist - samples[i + lag].RightCamRelWrist).magnitude;
+                            if (vc < 0.06f)
+                            {
+                                dot += vc * vm;
+                                normCtrl += vc * vc;
+                                normCam += vm * vm;
+                            }
+                        }
+                        if (samples[i].HasLeft && samples[i + 1].HasLeft && samples[i + lag].HasLeft && samples[i + 1 + lag].HasLeft)
+                        {
+                            float vc = (samples[i + 1].LeftCtrlWorldPos - samples[i].LeftCtrlWorldPos).magnitude;
+                            float vm = (samples[i + 1 + lag].LeftCamRelWrist - samples[i + lag].LeftCamRelWrist).magnitude;
+                            if (vc < 0.06f)
+                            {
+                                dot += vc * vm;
+                                normCtrl += vc * vc;
+                                normCam += vm * vm;
+                            }
+                        }
+                    }
+                    if (normCtrl > 1e-5f && normCam > 1e-5f)
+                    {
+                        float corr = dot / Mathf.Sqrt(normCtrl * normCam);
+                        if (corr > bestCorr)
+                        {
+                            bestCorr = corr;
+                            bestLag = lag;
+                        }
                     }
                 }
             }
@@ -1536,7 +1563,7 @@ namespace PsychophysicsVR.Tracking
                 ? (receiver.autoCalibrationLocked ? "<color=#66EEFF><b>AUTO-LOCKED</b></color>" : "<color=#FFEE66><b>AUTO-ALIGNING</b></color>")
                 : "<color=#CCCCCC><b>MANUAL</b></color>";
 
-            GUILayout.Label($"<b>Pimax + D455C v6.2 (3D Path Procrustes + CDSO PD)</b> | {fingerBadge} | {autoBadge}", labelStyle);
+            GUILayout.Label($"<b>Pimax + D455C v6.4 (4-Stop 3D Procrustes + CDSO PD)</b> | {fingerBadge} | {autoBadge}", labelStyle);
             GUILayout.Label($"Status: <b>{CalibrationStatusMessage}</b>", labelStyle);
             GUILayout.Label("<color=#AADDFF>VR Menu [Tab / A / X]: 3s Gaze Hold Clicks | Ctrl: [B/Y]=Mesh [Grip]=Arm [Grip+Trig]=Match</color>", labelStyle);
 
@@ -1547,7 +1574,7 @@ namespace PsychophysicsVR.Tracking
                 PerformOneClickCalibration();
             }
             GUI.backgroundColor = new Color(0.25f, 0.95f, 0.55f);
-            if (GUILayout.Button("Guided 8s Path Calib", btnStyle, GUILayout.Height(34)))
+            if (GUILayout.Button("4-Stop Hold Calib", btnStyle, GUILayout.Height(34)))
             {
                 GetComponent<VRDashboardAndController>()?.StartGuidedPathCalibrationPrompt();
             }

@@ -1,6 +1,6 @@
-# Pimax Crystal + Intel RealSense D455C VR Arm & 21-Finger Illusion System (v6.2)
+# Pimax Crystal + Intel RealSense D455C VR Arm & 21-Finger Illusion System (v6.4)
 
-Real-time, jitter-free 3D upper-limb and 21-DOF finger embodiment in **Unity VR** using the **Pimax Crystal HMD**, **Intel RealSense D455C Stereo Depth Camera**, and **Google MediaPipe**. Engineered for general seated psychophysics experiments (free reaching, strength-machine force illusions, and proprioceptive drift) with continuous 90/120 Hz Kalman prediction, Critically Damped Second-Order (CDSO) PD joint control, background torso auto-alignment, **8.5s Guided 6-DOF 3D Path Calibration**, and an in-headset 3D VR controller/gaze-dwell dashboard.
+Real-time, jitter-free 3D upper-limb and 21-DOF finger embodiment in **Unity VR** using the **Pimax Crystal HMD**, **Intel RealSense D455C Stereo Depth Camera**, and **Google MediaPipe**. Engineered for general seated psychophysics experiments (free reaching, strength-machine force illusions, and proprioceptive drift) with continuous 90/120 Hz Kalman prediction, Critically Damped Second-Order (CDSO) PD joint control, background torso auto-alignment, **User-Paced 4-Stop Move & Hold 6-DOF Calibration**, and an in-headset 3D VR controller/gaze-dwell dashboard.
 
 ---
 
@@ -98,7 +98,7 @@ Once your new Unity project opens:
 
 | Input (VR Controller / Keyboard) | Function |
 | :--- | :--- |
-| **`GUIDED 8s 3D PATH CALIBRATION`** (VR/HUD Button) | Spawns glowing 3D guide orb(s) for Right, Left, or Both arms. Hold controller(s), press **`A`/`X`/`Space`** (or hold inside the orb for `1.8s`), and follow the 5-stage 3D star + arc sweep. Automatically solves **temporal pipeline lag**, **3D Camera Yaw/Pitch/Roll**, **isotropic arm scale**, **independent Left/Right shoulder sockets**, and **6-DOF IMU wrist offset**! |
+| **`GUIDED 4-STOP HOLD CALIBRATION (All Modes)`** (VR/HUD Button) | Spawns glowing 3D guide orb(s) for Right, Left, or Both arms across 4 stationary non-coplanar stops inside the Pimax camera sweet spot. Hold controller(s) inside each orb for `1.2s` (or press `Trigger`/`A`/`X`/`Space`) to record zero-velocity 3D anchors. Solves **3D Camera Yaw/Pitch/Roll**, **isotropic arm scale**, **independent Left/Right shoulder sockets**, and **6-DOF IMU wrist offset** with zero velocity lag! |
 | **3-Second Gaze Hold** (Inside VR) | Hands-free menu click: hold your head-gaze cursor on any button on the floating 3D VR Dashboard for **3 seconds** to auto-click! |
 | **`A` / `X` Button** or **`Tab`** | **Show / Hide & Recenter 3D VR Dashboard** directly inside your Pimax headset! |
 | **Point + `Trigger`** | **Click any button** on the floating 3D VR Dashboard inside the headset. |

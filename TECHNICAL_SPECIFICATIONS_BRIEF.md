@@ -1,7 +1,7 @@
-# Technical Specifications Brief: Pimax Crystal + Intel RealSense D455C VR Visuomotor Arm & Hand Illusion System (v5.0)
+# Technical Specifications Brief: Pimax Crystal + Intel RealSense D455C VR Visuomotor Arm & Hand Illusion System (v6.0)
 
 ## 1. Executive Summary
-This document summarizes the hardware-software architecture developed for real-time upper-limb and 21-DOF finger embodiment in Unity VR using the **Pimax Crystal HMD** and **Intel RealSense D455C Stereo Depth Camera**. The system is engineered specifically for **psychophysics experiments on motor agency, proprioceptive drift, and pseudo-haptic force perception** on a seated strength-testing machine, prioritizing **sub-20ms visuomotor latency**, **metric 3D accuracy**, and **anatomical plausibility**.
+This document summarizes the hardware-software architecture developed for real-time, jitter-free upper-limb and 21-DOF finger embodiment in Unity VR using the **Pimax Crystal HMD** and **Intel RealSense D455C Stereo Depth Camera**. Version 6.0 upgrades the pipeline with **Rigid-Link Forward Kinematics + 1D Torso-Depth Kalman Fusion**, **Continuous 90/120 Hz Kalman Prediction**, **Critically Damped Second-Order (CDSO) PD Joint Control**, **$C^\infty$ Soft-Sigmoid Anatomical Constraints**, **Background Torso Auto-Alignment**, and an **In-Headset 3D VR Dashboard with Pimax OpenXR Controller Support** across general psychophysics tasks.
 
 ---
 
@@ -11,79 +11,71 @@ This document summarizes the hardware-software architecture developed for real-t
 flowchart LR
     subgraph Hardware["1. Sensor & Display Hardware"]
         D455["Intel RealSense D455C<br/>(Global Shutter RGB + Stereo Z16)"]
-        Pimax["Pimax Crystal VR HMD<br/>(OpenXR 6-DOF Head Tracking)"]
+        Pimax["Pimax Crystal HMD + Controllers<br/>(OpenXR 6-DOF Tracking @ 90-120 Hz)"]
     end
 
     subgraph PythonEngine["2. Python Sensor-Fusion Engine (realsense_d455_arm_tracker.py)"]
-        Align["Hardware Depth-to-Color Align<br/>(frames_queue_size = 1)"]
+        Align["Depth-to-Color Align<br/>(frames_queue_size = 4)"]
         MPPose["MediaPipe PoseLandmarker Lite<br/>(Async LIVE_STREAM)"]
         MPHand["MediaPipe HandLandmarker<br/>(Adaptive 1-Hand / 2-Hand Gate)"]
-        Fusion["Gaussian Depth Fusion &<br/>Kinematic State Prior"]
+        RigidFK["1D Torso-Depth Kalman +<br/>Rigid-Link Forward Kinematics"]
     end
 
-    subgraph UnityVR["3. Unity VR Reconstruction & Perturbation Engine"]
+    subgraph UnityVR["3. Unity VR Control & Interaction Engine"]
         UDP["Zero-Backlog UDP Receiver<br/>(660-Byte Packet @ 60 Hz)"]
-        Euro["State-Informed 1-Euro Filter<br/>+ 12ms Velocity Lead Prediction"]
-        Perturb["Psychophysics Perturbation Engine<br/>(Gain, Drag, Angle, Delay Buffer)"]
-        TrigIK["Cross-Product-Free Trigonometric IK<br/>+ Impossible-Pose Filter"]
-        MeshGen["Switchable 3D Renderer<br/>(Continuous Skinned Mesh / Bubble / OpenXR FBX)"]
+        Kalman["Continuous-Discrete 3D Kalman Predictor<br/>(90/120 Hz Predict + Confidence Update)"]
+        AutoAlign["Background Torso Auto-Alignment<br/>& VR Controller Cross-Calibration"]
+        CDSO["CDSO PD Springs (zeta=1.0) +<br/>C-infinity Soft-Sigmoid IK"]
+        MeshGen["Switchable 3D Renderer &<br/>In-Headset 3D VR Dashboard"]
     end
 
     D455 --> Align
-    Align --> MPPose & MPHand & Fusion
-    MPPose & MPHand --> Fusion
-    Fusion -- "Localhost UDP :5055" --> UDP
-    Pimax -- "Head Yaw Anchor" --> TrigIK
-    UDP --> Euro --> Perturb --> TrigIK --> MeshGen
+    Align --> MPPose & MPHand & RigidFK
+    MPPose & MPHand --> RigidFK
+    RigidFK -- "Localhost UDP :5055" --> UDP
+    Pimax -- "Head Yaw + Controller Ray" --> CDSO & MeshGen & AutoAlign
+    UDP --> Kalman --> AutoAlign --> CDSO --> MeshGen
 ```
 
 ---
 
 ## 3. Core Technical Subsystems
 
-### 3.1. Sensor Acquisition & Hybrid 3D Depth Fusion (`realsense_d455_arm_tracker.py`)
-* **Auto-Negotiated Low-Latency Stream Profile:** Queries the D455C over USB and selects the fastest valid hardware-synchronized Depth (`Z16`) + Color (`BGR8`) profile (`640x480 @ 60 FPS` or `848x480 @ 60 FPS`), setting internal sensor queues to `frames_queue_size = 1` to eliminate frame buffering.
-* **Non-Queueing Concurrent MediaPipe Inference:**
-  * Runs **MediaPipe PoseLandmarker (Lite)** (`11..20` upper-body landmarks) and **MediaPipe HandLandmarker** (`0..20` 3D finger/knuckle landmarks) concurrently on background C++ threads.
-  * **Adaptive Single/Dual Hand Gate:** Automatically uses `num_hands = 1` in single-arm modes (and whenever only one wrist is inside the camera FOV in Dual-Arm mode) so MediaPipe skips the heavy full-frame SSD palm detector, keeping hand inference at **~3 ms**.
-* **Continuous Gaussian Depth Blending:**
-  * Samples a $7 \times 7$ pixel patch around each joint and computes the **35th percentile foreground depth** (preventing background wall bleed at limb silhouettes).
-  * Fuses D455C hardware metric depth ($d_{\text{sensor}}$) with MediaPipe's anatomical depth offset ($z_{\text{expected}}$) using a continuous Gaussian confidence curve ($\sigma = 0.14\text{ m}$), eliminating step-threshold discontinuities during long forward reaches.
-* **Kinematic State Prior & Bone-Length Stabilization:**
-  * Bounds frame-to-frame joint velocities to human biomechanical limits ($1.8\text{ m/s}$ shoulder, $4.5\text{ m/s}$ elbow, $7.0\text{ m/s}$ wrist) and projects `(Elbow - Shoulder)` and `(Wrist - Elbow)` onto running anatomical bone-length estimates ($\pm 12\%$), preventing camera foreshortening from stretching or collapsing the arm.
+### 3.1. Rigid-Link Forward Kinematics & 1D Torso-Depth Kalman Fusion (`realsense_d455_arm_tracker.py`)
+* **Elimination of Silhouette Depth Spikes:**
+  * Instead of deprojecting noisy per-pixel depth patches independently at the elbow and wrist (which caused depth spikes whenever a landmark crossed the cylindrical edge of the arm during 10 cm movements), v6.0 runs a **1D Kalman Filter** (`torso_z_est`, `q = 0.0002`, `r = 0.015`) over an $11\times 11$ foreground patch at the shoulder/torso.
+  * For Elbow and Wrist, D455C depth differences within $0.18\text{ m}$ of MediaPipe’s relative depth apply a gentle Huber-bounded innovation (max $\pm 0.20$ weight) to a smoothed relative depth state.
+* **Continuous Metric Arm-Scale Estimation:**
+  * A slow 1D Kalman Filter (`est_arm_scale`, `q = 0.00005`) tracks true upper-arm + forearm scale whenever joint visibility $> 0.65$.
+* **Rigid-Link Forward Kinematics Before Velocity Updates:**
+  * Extracts unit bone vectors $(\hat{\mathbf{u}}_{\text{upper}}, \hat{\mathbf{u}}_{\text{fore}})$ and reconstructs 3D Elbow and Wrist strictly along rigid link lengths $(0.28\text{ m} \cdot S, 0.25\text{ m} \cdot S)$ **before** computing velocities, eliminating bone-length clamp limit cycles.
+* **Adaptive Single/Dual 21-Finger Gate:**
+  * Uses `num_hands = 1` whenever only one wrist is inside the camera FOV so MediaPipe skips full-frame palm re-detection (~3 ms hand latency).
 
-### 3.2. Zero-Backlog UDP Protocol & State-Informed 1€ Filtering (`RealSenseArmReceiver.cs`, `OneEuroFilter.cs`)
-* **660-Byte Dual-Arm Binary Packet (`165 floats`):**
-  * Streams Right Arm (`Shoulder, Elbow, Wrist, Index, Pinky`), Left Arm (`Shoulder, Elbow, Wrist, Index, Pinky`), Chest Axis (`LeftShoulder -> RightShoulder`), Right 21 Finger 3D Landmarks, Left 21 Finger 3D Landmarks, confidence metrics, and active mode flag over localhost UDP (`127.0.0.1:5055`).
-  * Drains the OS UDP socket buffer (`while (_udpClient.Available > 0)`) on every read so Unity always renders the freshest frame with **zero queue latency**.
-* **State-Informed 1-Euro Filter with Velocity Lead Prediction:**
-  * Filters joint displacements relative to the shoulder (`e - s`, `w - s`) so torso micro-sway never shakes the hand.
-  * Applies adaptive cutoff tuning (`minCutoff = 2.2 Hz`, `beta = 0.22`) combined with **12 ms Velocity Lead Prediction** (`motionPredictionMs`) to compensate for USB + rendering pipeline delay.
+### 3.2. Continuous-Discrete 3D Kalman Predictor (`RealSenseArmReceiver.cs`, `OneEuroFilter.cs`)
+* **Elimination of 30–60 Hz Sample-and-Hold Judder:**
+  * `KalmanFilter3D` advances position & velocity continuously on **every 90/120 Hz Pimax VR render frame** (`Predict(dt)` with biomechanical damping $e^{-3.5 \Delta t}$).
+  * When a UDP packet arrives, `UpdateMeasurement(z, confidence)` updates $(p, v)$ using adaptive covariance $R = r_0 / \text{confidence}^2$ and a smooth Huber innovation clamp.
+* **Background Torso Auto-Alignment (`continuousAutoCalibration`):**
+  * Locks `cameraYawOffsetDeg` and `armScale` automatically within the first ~30 valid dual-shoulder frames and tracks slow posture drift at $\le 0.5^\circ/\text{s}$, eliminating mandatory per-user manual calibration.
 
-### 3.3. Cross-Product-Free Trigonometric IK & Impossible-Pose Filter (`ArmAvatarController.cs`)
-* **Elimination of Straight-Arm & Headset-Startup Singularities:**
-  * Traditional `Vector3.Cross(elbowHint, wristDir)` IK solvers suffer from $180^\circ$ sign-flip inversions when the user raises their hands to adjust their VR headset at startup or reaches straight toward the camera.
-  * v5.0 replaces cross-product rotation with a **Direct Trigonometric IK Solver**:
-    $$\mathbf{d}_{\text{elbow}} = \cos(\theta_A)\,\mathbf{d}_{\text{wrist}} + \sin(\theta_A)\,\mathbf{e}_{\perp}$$
-    Because $\sin(\theta_A) \ge 0$ for all $\theta_A \in [0, \pi]$, the elbow is mathematically guaranteed to bend into the valid anatomical half-plane $\mathbf{e}_{\perp}$.
-* **Biomechanical ROM & Headset-Holding Guard:**
-  * Detects when the user's hand is raised within $28\text{ cm}$ of the Pimax HMD (putting on or adjusting the headset), blocking accidental calibration and smoothly weighting the elbow toward a natural downward-tucked posture.
-  * Clamps impossible upward elbow flips (`localElbow.y > -0.02m`), medial chest penetration (`localElbow.x * sideSign < -0.10m`), posterior shoulder hyperextension, and wrist hyper-flexion ($> 70^\circ$).
-* **Head-Yaw-Only Shoulder Anchoring:**
-  * Locks `RightShoulderAnchor` and `LeftShoulderAnchor` to the Pimax HMD's 3D position + **horizontal yaw only**, ensuring that pitching the head downward to look at the arm in VR never pushes the virtual shoulder downward.
+### 3.3. Critically Damped Second-Order (CDSO) PD Joint Controller & Soft-Sigmoid Constraints (`ArmAvatarController.cs`)
+* **Closed-Form Critically Damped Spring-Dampers ($\zeta = 1.0$):**
+  * Drives wrist targets, elbow swivel direction, and quaternion bone rotations via exact analytical second-order PD springs (`CriticallyDampedSpring3D`, `CriticallyDampedQuaternion`, default $f_n = 4.8\text{ Hz}$). Finite acceleration absorbs high-frequency sensor noise with **zero overshoot**.
+* **$C^\infty$ Soft-Sigmoid Anatomical Constraints (`BiomechanicalMath.SoftMin/SoftMax`):**
+  * Replaces discontinuous hard `if` clamps with smooth $C^\infty$ softplus barriers on posterior shoulder reach (`z >= -0.10m`), upward elbow inversion (`y <= -0.03m`), and medial chest crossing (`x * side >= -0.10m`), eliminating 13 cm boundary teleport pops.
+* **Cross-Product-Free Trigonometric IK:**
+  $$\mathbf{d}_{\text{elbow}} = \cos(\theta_A)\,\mathbf{d}_{\text{wrist}} + \sin(\theta_A)\,\mathbf{e}_{\perp}$$
+  Guarantees mathematically that the elbow never inverts $180^\circ$ during headset adjustment or straight-arm reaches.
 
-### 3.4. Switchable 3D Hand & Arm Representations (`ProceduralHandMeshBuilder.cs`)
-Pressing **`M`** in Unity cycles live between:
-1. **`MicrosoftContinuousMesh`:** A single, unified, dynamically skinned 3D triangle `Mesh` (`ContinuousHandArmMesh`) featuring 12-sided elliptical lofted cross-sections from the deltoid/bicep through the forearm, a sculpted palmar arch with thumb thenar eminence, and 5 seamless tapered fingers with closed rounded fingertips in a sleek MRTK Holo-White metallic finish.
-2. **`HumanSkinContinuousMesh`:** The same continuous, joint-seamless 3D organic hand & arm mesh rendered with a warm human skin material.
-3. **`BubbleJoints`:** High-contrast kinematic visualization with gold joint spheres and segmented phalange capsules.
-4. **`CustomRiggedPrefab`:** Automatic bone-mapper (`AutoMapCustomHandBones`) that drives imported **Microsoft MRTK / OpenXR (`com.unity.xr.hands`)** rigged hand FBX prefabs.
+### 3.4. In-Headset 3D VR Dashboard & Pimax Controller Integration (`VRDashboardAndController.cs`)
+* **3D World-Space VR Menu:** Renders an interactive 3D floating control panel directly inside the Pimax Crystal headset (toggleable via `A`/`X` on controllers or `Tab` on keyboard) with a 3D laser pointer ray from the active OpenXR controller (`Trigger` to click).
+* **Controller-Referenced Golden Calibration (`CalibrateToVRController`):** Pressing **`Grip + Trigger`** cross-references the sub-millimeter 3D pose of the Pimax OpenXR controller with MediaPipe + D455C to align camera yaw, arm scale, and shoulder offset simultaneously.
+* **Multi-Experiment Presets (`ExperimentPreset`):** Supports `GeneralFreeMovement` (shoulder-centered gain), `StrengthMachineTask` (handle-origin gain + visible target sphere), and `ProprioceptiveDriftTask`.
 
-### 3.5. Psychophysics Perturbation Engine & Persistent Memory
-* **Real-Time Experimental Perturbations:**
-  * `movementGain` ($0.2\times - 2.5\times$): Scales visual reach displacement from the calibrated strength-machine handle origin (`CalibratedHandleOrigin`) to induce pseudo-haptic heavy/light load illusions.
-  * `pseudoHapticDrag` ($0 - 20$): Viscous lag proportional to force/speed changes.
-  * `elbowFlexionOffsetDeg` ($\pm 45^\circ$): Angular perturbation around the elbow hinge axis for proprioceptive drift trials.
-  * `artificialDelayMs` ($0 - 300\text{ ms}$): Ring-buffer temporal delay injection for sense-of-agency breakdown experiments.
-* **Persistent Session Memory:** Automatically saves and restores all calibrated parameters (`armScale`, `cameraYawOffsetDeg`, `shoulderOffsetFromHead`, filter settings, active arm mode, and 3D mesh style) via Unity `PlayerPrefs`.
-
+### 3.5. Switchable 3D Hand & Arm Representations (`ProceduralHandMeshBuilder.cs`)
+Pressing **`B`/`Y`** on a VR controller (or **`M`** on keyboard) cycles live between:
+1. **`MicrosoftContinuousMesh`:** Unified, dynamically skinned 3D triangle `Mesh` with 12-sided elliptical lofted rings, sculpted palmar arch, thumb thenar muscle, and 5 seamless tapered fingers in MRTK Holo-White finish.
+2. **`HumanSkinContinuousMesh`:** Unified continuous 3D mesh in human skin tone.
+3. **`BubbleJoints`:** High-contrast gold joint spheres and segmented phalange capsules.
+4. **`CustomRiggedPrefab`:** Automatic bone mapper for imported OpenXR / Microsoft MRTK rigged hand FBX prefabs.

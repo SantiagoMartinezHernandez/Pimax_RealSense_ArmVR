@@ -34,25 +34,29 @@ namespace PsychophysicsVR.Tracking
             GameObject managerGo = GameObject.Find("ArmTrackingManager") ?? new GameObject("ArmTrackingManager");
             RealSenseArmReceiver receiver = managerGo.GetComponent<RealSenseArmReceiver>() ?? Undo.AddComponent<RealSenseArmReceiver>(managerGo);
             ArmAvatarController controller = managerGo.GetComponent<ArmAvatarController>() ?? Undo.AddComponent<ArmAvatarController>(managerGo);
+            VRDashboardAndController vrUi = managerGo.GetComponent<VRDashboardAndController>() ?? Undo.AddComponent<VRDashboardAndController>(managerGo);
 
             receiver.avatarShoulderAnchor = rShoulderGo.transform;
             receiver.leftAvatarShoulderAnchor = lShoulderGo.transform;
             receiver.cameraOrientationReference = camOrientGo.transform;
             controller.receiver = receiver;
             controller.lockShoulderToHeadsetYaw = true;
+            vrUi.controller = controller;
+            vrUi.receiver = receiver;
 
             Selection.activeGameObject = managerGo;
             EditorUtility.SetDirty(receiver);
             EditorUtility.SetDirty(controller);
+            EditorUtility.SetDirty(vrUi);
 
-            Debug.Log("✅ [Psychophysics VR v5.0] Scene Setup Complete!");
+            Debug.Log("✅ [Psychophysics VR v6.0] Scene Setup Complete!");
             EditorUtility.DisplayDialog(
-                "Psychophysics VR v5.0 Setup Complete!",
+                "Psychophysics VR v6.0 Setup Complete!",
                 "Ready with:\n" +
-                "• Continuous 3D Skinned Hand & Arm Mesh (Microsoft Holo-Style, Human Skin, & Bubble Joints — Press 'M')\n" +
-                "• Cross-Product-Free Trigonometric IK & Impossible-Pose Filter\n" +
-                "• Right, Left, and Dual-Arm support (Press 'R')\n" +
-                "• Automatic Persistent Session Memory",
+                "• Rigid-Link + 90/120Hz Continuous Kalman Predictor + CDSO PD Joint Controller\n" +
+                "• Background Torso Auto-Alignment (no mandatory per-user calibration!)\n" +
+                "• In-Headset 3D World-Space VR Menu & Pimax Controller Laser Pointer ([A/X] Menu, [B/Y] Mesh, [Grip] Arm)\n" +
+                "• Multi-Experiment Presets (General / Strength Machine / Proprioceptive Drift)",
                 "Awesome!"
             );
         }

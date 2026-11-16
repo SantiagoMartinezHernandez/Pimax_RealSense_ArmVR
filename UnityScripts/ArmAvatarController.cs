@@ -21,26 +21,32 @@ namespace PsychophysicsVR.Tracking
         CustomRiggedPrefab = 3
     }
 
+    public enum ExperimentPreset
+    {
+        GeneralFreeMovement = 0,
+        StrengthMachineTask = 1,
+        ProprioceptiveDriftTask = 2
+    }
+
     /// <summary>
-    /// Dual-Arm + 21-Finger Articulated Hand Controller for Pimax VR Psychophysics (v5.0).
-    /// Upgrades in v5.0:
-    ///   1. TRUE Continuous 3D Hand & Arm Mesh (ContinuousHandArmMesh):
-    ///      Press 'M' to toggle between BubbleJoints, MicrosoftContinuousMesh (unified smooth-shaded 3D
-    ///      hand & arm mesh with sculpted palm, thumb thenar muscle, and seamless tapered fingers),
-    ///      and HumanSkinContinuousMesh!
-    ///   2. Anatomical Impossible-Pose Filter & Cross-Product-Free Trigonometric IK:
-    ///      Eliminates the 180-degree sign-flip bug when starting with hands near the VR headset,
-    ///      and clamps elbow/wrist trajectories to valid human biomechanical ROM cones.
-    ///   3. Dual-Arm Support ('R' key) + Persistent Calibration Memory (PlayerPrefs).
+    /// v6.0 Dual-Arm + 21-Finger Articulated Hand Controller for Pimax VR Psychophysics.
+    /// Upgrades in v6.0:
+    ///   1. Critically Damped Second-Order (CDSO) PD Joint Controller + C-infinity Soft-Sigmoid
+    ///      Anatomical Constraints (absorbs 10cm movement jitter with zero overshoot or boundary pops).
+    ///   2. General Multi-Experiment Architecture (GeneralFreeMovement, StrengthMachineTask, ProprioceptiveDriftTask).
+    ///   3. Background Torso Auto-Alignment + Pimax VR Controller Cross-Calibration (`CalibrateToVRController`).
+    ///   4. Auto-attaches `VRDashboardAndController` so a 3D World-Space UI & Controller Laser Pointer
+    ///      are immediately available inside the Pimax Crystal headset.
     /// </summary>
     public class ArmAvatarController : MonoBehaviour
     {
-        private const string PrefPrefix = "PimaxArmVR_v5_";
+        private const string PrefPrefix = "PimaxArmVR_v6_";
 
         [Header("Tracking Source")]
         public RealSenseArmReceiver receiver;
 
-        [Header("Arm Selection & 3D Model Style (Press 'R' and 'M' or use HUD)")]
+        [Header("Experiment Configuration & Visuals")]
+        public ExperimentPreset experimentPreset = ExperimentPreset.GeneralFreeMovement;
         public ActiveArmMode activeArmMode = ActiveArmMode.RightArmOnly;
         public HandVisualStyle handVisualStyle = HandVisualStyle.MicrosoftContinuousMesh;
 
@@ -54,20 +60,21 @@ namespace PsychophysicsVR.Tracking
         [Tooltip("Right Shoulder offset from VR Headset (Eyes) in meters: X = Right (+0.18m), Y = Down (-0.15m), Z = Forward (0.00m).")]
         public Vector3 shoulderOffsetFromHead = new Vector3(0.18f, -0.15f, 0.00f);
 
-        [Header("Arm Dimensions & Speed")]
+        [Header("Arm Dimensions & CDSO PD Joint Controller")]
         public float prototypeUpperArmLength = 0.28f;
         public float prototypeForearmLength = 0.25f;
         public float handSizeScale = 1.05f;
 
-        [Range(10f, 80f)]
-        public float boneRotationSmoothing = 42f;
+        [Tooltip("Critically Damped Second-Order PD Controller natural frequency (Hz). Lower = silkier smooth, Higher = faster snap (4.8 Hz recommended).")]
+        [Range(1.5f, 12.0f)]
+        public float pdNaturalFrequencyHz = 4.8f;
 
-        [Header("Persistent Calibration & HUD")]
+        [Header("Persistent Calibration & Desktop HUD")]
         public bool autoLoadSavedCalibration = true;
         public bool triggerCalibrationNow = false;
         public bool showOnScreenCalibrationHUD = true;
         [Range(1.0f, 3.0f)]
-        public float hudScale = 1.65f;
+        public float hudScale = 1.55f;
 
         [Header("Psychophysics Perturbation Controls")]
         [Range(0.2f, 2.5f)]
@@ -92,7 +99,7 @@ namespace PsychophysicsVR.Tracking
         private ProceduralArmRig _rightArmRig;
         private ProceduralArmRig _leftArmRig;
         private int _lastSyncedPythonArmMode = -1;
-        private string _calibrationStatusMessage = "Ready! Press [C] to Calibrate, [M] to switch 3D Hand Mesh, [R] for Left/Right/Both.";
+        public string CalibrationStatusMessage { get; private set; } = "Auto-Align Active! Use VR Controller [A/X] for In-Headset Menu.";
         private float _calibrationFlashTimer = 0f;
 
         private static readonly int[,] FingerBonePairs = new int[20, 2]
@@ -130,12 +137,16 @@ namespace PsychophysicsVR.Tracking
             public Transform CustomHandInstance;
             public readonly Transform[] CustomMappedBones = new Transform[21];
 
-            // Biomechanical state for impossible-pose filtering & trigonometric IK
-            public Vector3 PrevWristTarget;
-            public Vector3 PrevElbowHint;
+            // CDSO Critically Damped Second-Order PD Controllers
+            public readonly CriticallyDampedSpring3D WristSpring = new CriticallyDampedSpring3D();
+            public readonly CriticallyDampedSpring3D ElbowPerpSpring = new CriticallyDampedSpring3D();
+            public readonly CriticallyDampedSpring3D HandFwdSpring = new CriticallyDampedSpring3D();
+            public readonly CriticallyDampedSpring3D PalmNormSpring = new CriticallyDampedSpring3D();
+            public readonly CriticallyDampedQuaternion UpperArmRotPD = new CriticallyDampedQuaternion();
+            public readonly CriticallyDampedQuaternion ForearmRotPD = new CriticallyDampedQuaternion();
+            public readonly CriticallyDampedQuaternion HandRotPD = new CriticallyDampedQuaternion();
+
             public Vector3 SmoothedElbowPerpDir;
-            public Vector3 SmoothedHandForward = Vector3.forward;
-            public Vector3 SmoothedPalmNormal = Vector3.up;
             public Vector3 DraggedWristPos;
             public bool PoseInitialized;
             public bool DragInitialized;
@@ -150,7 +161,6 @@ namespace PsychophysicsVR.Tracking
             public ProceduralArmRig(bool isRight)
             {
                 IsRight = isRight;
-                // Natural anatomical elbow direction: downward (-Y) and slightly outward (+-X)
                 SmoothedElbowPerpDir = new Vector3(isRight ? 0.35f : -0.35f, -0.92f, -0.15f).normalized;
                 InitDefaultFingers();
             }
@@ -192,6 +202,11 @@ namespace PsychophysicsVR.Tracking
             forearmBone = _rightArmRig.ForearmBone;
             handBone = _rightArmRig.HandBone;
 
+            if (receiver != null)
+            {
+                receiver.avatarTargetTotalArmLength = prototypeUpperArmLength + prototypeForearmLength;
+            }
+
             if (autoLoadSavedCalibration)
             {
                 LoadPersistentSettings();
@@ -199,6 +214,13 @@ namespace PsychophysicsVR.Tracking
 
             ApplyVisualStyleToBothArms();
             UpdateActiveArmVisibility();
+            UpdateHandleMarkerVisibility();
+
+            // Auto-attach In-Headset 3D VR Dashboard & Pimax OpenXR Controller Integration
+            if (GetComponent<VRDashboardAndController>() == null)
+            {
+                gameObject.AddComponent<VRDashboardAndController>();
+            }
         }
 
         private void EnsureShoulderAnchors()
@@ -245,7 +267,7 @@ namespace PsychophysicsVR.Tracking
                         activeArmMode = (ActiveArmMode)receiver.remotePythonArmMode;
                         UpdateActiveArmVisibility();
                         SavePersistentSettings();
-                        _calibrationStatusMessage = $"Synced Arm Mode from Python: {activeArmMode}";
+                        CalibrationStatusMessage = $"Synced Arm Mode from Python: {activeArmMode}";
                     }
                     _lastSyncedPythonArmMode = receiver.remotePythonArmMode;
                 }
@@ -267,7 +289,7 @@ namespace PsychophysicsVR.Tracking
             activeArmMode = (ActiveArmMode)(((int)activeArmMode + 1) % 3);
             UpdateActiveArmVisibility();
             SavePersistentSettings();
-            _calibrationStatusMessage = $"Switched Arm Mode to: {activeArmMode}";
+            CalibrationStatusMessage = $"Arm Mode: {activeArmMode}";
         }
 
         public void CycleVisualStyle()
@@ -276,7 +298,25 @@ namespace PsychophysicsVR.Tracking
             handVisualStyle = (HandVisualStyle)(((int)handVisualStyle + 1) % maxModes);
             ApplyVisualStyleToBothArms();
             SavePersistentSettings();
-            _calibrationStatusMessage = $"Switched 3D Model to: {handVisualStyle}";
+            CalibrationStatusMessage = $"3D Model: {handVisualStyle}";
+        }
+
+        public void CycleExperimentPreset()
+        {
+            experimentPreset = (ExperimentPreset)(((int)experimentPreset + 1) % 3);
+            UpdateHandleMarkerVisibility();
+            SavePersistentSettings();
+            CalibrationStatusMessage = $"Experiment Task: {experimentPreset}";
+        }
+
+        public void ToggleContinuousAutoCalibration()
+        {
+            if (receiver == null) return;
+            receiver.continuousAutoCalibration = !receiver.continuousAutoCalibration;
+            if (receiver.continuousAutoCalibration)
+                receiver.ResetAutoCalibrationLock();
+            SavePersistentSettings();
+            CalibrationStatusMessage = $"Auto-Align Chest: {(receiver.continuousAutoCalibration ? "ON" : "OFF")}";
         }
 
         private void UpdateActiveArmVisibility()
@@ -285,6 +325,14 @@ namespace PsychophysicsVR.Tracking
                 _rightArmRig.RootGo.SetActive(activeArmMode == ActiveArmMode.RightArmOnly || activeArmMode == ActiveArmMode.BothArms);
             if (_leftArmRig?.RootGo != null)
                 _leftArmRig.RootGo.SetActive(activeArmMode == ActiveArmMode.LeftArmOnly || activeArmMode == ActiveArmMode.BothArms);
+        }
+
+        private void UpdateHandleMarkerVisibility()
+        {
+            if (machineHandleOrigin != null)
+            {
+                machineHandleOrigin.gameObject.SetActive(experimentPreset == ExperimentPreset.StrengthMachineTask);
+            }
         }
 
         private void UpdateShoulderAnchorsFromHeadset()
@@ -340,17 +388,16 @@ namespace PsychophysicsVR.Tracking
         {
             if (receiver == null || !receiver.HasValidTracking)
             {
-                _calibrationStatusMessage = "⚠️ Waiting for D455C tracking data before calibrating!";
+                CalibrationStatusMessage = "Waiting for D455C tracking data before calibrating!";
                 return;
             }
 
-            // Guard against calibrating while the user's hand is raised up holding their VR headset!
             bool useLeft = (activeArmMode == ActiveArmMode.LeftArmOnly);
             Vector3 localReach = useLeft ? receiver.LocalLeftShoulderToWrist : receiver.LocalShoulderToWrist;
             if (localReach.y > 0.08f && new Vector2(localReach.x, localReach.z).magnitude < 0.25f)
             {
-                _calibrationStatusMessage = "⚠️ Hand appears raised near VR Headset! Lower hand to machine handle & press [C].";
-                Debug.LogWarning("[ArmAvatarController] " + _calibrationStatusMessage);
+                CalibrationStatusMessage = "Hand appears raised near VR Headset! Lower hand & press [C].";
+                Debug.LogWarning("[ArmAvatarController] " + CalibrationStatusMessage);
                 return;
             }
 
@@ -380,22 +427,106 @@ namespace PsychophysicsVR.Tracking
                 }
             }
 
-            // Reset elbow swivel directions to clean anatomical downward pole on calibration
-            if (_rightArmRig != null)
-                _rightArmRig.SmoothedElbowPerpDir = new Vector3(0.35f, -0.92f, -0.15f).normalized;
-            if (_leftArmRig != null)
-                _leftArmRig.SmoothedElbowPerpDir = new Vector3(-0.35f, -0.92f, -0.15f).normalized;
+            ResetArmElbowPoles();
 
-            EnsureHandleMarker();
-            Quaternion yawRot = Quaternion.Euler(0f, receiver.cameraYawOffsetDeg, 0f);
-            Transform anchor = useLeft ? receiver.leftAvatarShoulderAnchor : receiver.avatarShoulderAnchor;
-            machineHandleOrigin.position = anchor.position + yawRot * (localReach * receiver.armScale);
+            if (experimentPreset == ExperimentPreset.StrengthMachineTask)
+            {
+                EnsureHandleMarker();
+                Quaternion yawRot = Quaternion.Euler(0f, receiver.cameraYawOffsetDeg, 0f);
+                Transform anchor = useLeft ? receiver.leftAvatarShoulderAnchor : receiver.avatarShoulderAnchor;
+                machineHandleOrigin.position = anchor.position + yawRot * (localReach * receiver.armScale);
+                machineHandleOrigin.gameObject.SetActive(true);
+            }
 
             SavePersistentSettings();
 
             _calibrationFlashTimer = 3.0f;
-            _calibrationStatusMessage = $"✅ CALIBRATED & SAVED! Scale={receiver.armScale:F2}x | CamYaw={receiver.cameraYawOffsetDeg:F0}°";
-            Debug.Log($"[ArmAvatarController] {_calibrationStatusMessage}");
+            CalibrationStatusMessage = $"Calibrated! Scale={receiver.armScale:F2}x | CamYaw={receiver.cameraYawOffsetDeg:F0} deg";
+            Debug.Log($"[ArmAvatarController] {CalibrationStatusMessage}");
+        }
+
+        /// <summary>
+        /// Uses the Pimax OpenXR Controller's sub-millimeter 3D position as a golden reference
+        /// to align camera yaw, arm scale, and shoulder offset simultaneously!
+        /// </summary>
+        public void CalibrateToVRController(Vector3 controllerWorldPos, Quaternion controllerWorldRot, bool isLeftController)
+        {
+            if (receiver == null || !receiver.HasValidTracking)
+            {
+                CalibrationStatusMessage = "Cannot match VR controller: waiting for D455C camera stream!";
+                return;
+            }
+
+            UpdateShoulderAnchorsFromHeadset();
+
+            Transform anchor = isLeftController ? receiver.leftAvatarShoulderAnchor : receiver.avatarShoulderAnchor;
+            Vector3 localReach = isLeftController ? receiver.LocalLeftShoulderToWrist : receiver.LocalShoulderToWrist;
+            if (anchor == null || localReach.sqrMagnitude < 0.01f) return;
+
+            // 1. Align horizontal Yaw between tracked shoulder->wrist vector and shoulder->VRController vector
+            Vector3 desiredVec = controllerWorldPos - anchor.position;
+            Vector3 desiredXZ = new Vector3(desiredVec.x, 0f, desiredVec.z);
+            Vector3 localXZ = new Vector3(localReach.x, 0f, localReach.z);
+            if (desiredXZ.magnitude > 0.10f && localXZ.magnitude > 0.10f)
+            {
+                float rawAngle = Mathf.Atan2(localXZ.x, localXZ.z) * Mathf.Rad2Deg;
+                float targetAngle = Mathf.Atan2(desiredXZ.x, desiredXZ.z) * Mathf.Rad2Deg;
+                receiver.cameraYawOffsetDeg = Mathf.DeltaAngle(rawAngle, targetAngle);
+            }
+
+            // 2. Match arm scale to controller reach distance (within anatomical limits)
+            float totalAvatarArm = prototypeUpperArmLength + prototypeForearmLength;
+            receiver.CalibrateArmScaleToAvatar(totalAvatarArm);
+
+            // 3. Shift shoulderOffsetFromHead gently so the mapped wrist lands on the exact controller 3D point
+            Quaternion baseRot = receiver.cameraOrientationReference != null ? receiver.cameraOrientationReference.rotation : Quaternion.identity;
+            Quaternion yawRot = Quaternion.Euler(0f, receiver.cameraYawOffsetDeg, 0f) * baseRot;
+            Vector3 mappedWrist = anchor.position + yawRot * (localReach * receiver.armScale);
+            Vector3 worldErr = controllerWorldPos - mappedWrist;
+
+            if (_vrCamera != null)
+            {
+                Quaternion invHeadYaw = Quaternion.Inverse(Quaternion.Euler(0f, _vrCamera.transform.eulerAngles.y, 0f));
+                Vector3 localErr = invHeadYaw * worldErr;
+                if (isLeftController) localErr.x = -localErr.x;
+
+                shoulderOffsetFromHead += localErr;
+                // Keep shoulder inside plausible anatomical bounds relative to the HMD eyes
+                shoulderOffsetFromHead.x = Mathf.Clamp(shoulderOffsetFromHead.x, 0.08f, 0.30f);
+                shoulderOffsetFromHead.y = Mathf.Clamp(shoulderOffsetFromHead.y, -0.30f, -0.04f);
+                shoulderOffsetFromHead.z = Mathf.Clamp(shoulderOffsetFromHead.z, -0.18f, 0.18f);
+                UpdateShoulderAnchorsFromHeadset();
+            }
+
+            if (experimentPreset == ExperimentPreset.StrengthMachineTask)
+            {
+                EnsureHandleMarker();
+                machineHandleOrigin.position = controllerWorldPos;
+                machineHandleOrigin.gameObject.SetActive(true);
+            }
+
+            ResetArmElbowPoles();
+            SavePersistentSettings();
+
+            _calibrationFlashTimer = 3.0f;
+            CalibrationStatusMessage = $"Matched VR Controller! Yaw={receiver.cameraYawOffsetDeg:F0} deg, ShY={shoulderOffsetFromHead.y:F2}m";
+            Debug.Log($"[ArmAvatarController] {CalibrationStatusMessage}");
+        }
+
+        private void ResetArmElbowPoles()
+        {
+            if (_rightArmRig != null)
+            {
+                Vector3 p = new Vector3(0.35f, -0.92f, -0.15f).normalized;
+                _rightArmRig.SmoothedElbowPerpDir = p;
+                _rightArmRig.ElbowPerpSpring.Snap(p);
+            }
+            if (_leftArmRig != null)
+            {
+                Vector3 p = new Vector3(-0.35f, -0.92f, -0.15f).normalized;
+                _leftArmRig.SmoothedElbowPerpDir = p;
+                _leftArmRig.ElbowPerpSpring.Snap(p);
+            }
         }
 
         private void EnsureHandleMarker()
@@ -426,12 +557,14 @@ namespace PsychophysicsVR.Tracking
             PlayerPrefs.SetInt(PrefPrefix + "HasSaved", 1);
             PlayerPrefs.SetFloat(PrefPrefix + "ArmScale", receiver.armScale);
             PlayerPrefs.SetFloat(PrefPrefix + "CamYaw", receiver.cameraYawOffsetDeg);
+            PlayerPrefs.SetInt(PrefPrefix + "AutoCalib", receiver.continuousAutoCalibration ? 1 : 0);
             PlayerPrefs.SetFloat(PrefPrefix + "ShoulderX", shoulderOffsetFromHead.x);
             PlayerPrefs.SetFloat(PrefPrefix + "ShoulderY", shoulderOffsetFromHead.y);
             PlayerPrefs.SetFloat(PrefPrefix + "ShoulderZ", shoulderOffsetFromHead.z);
-            PlayerPrefs.SetFloat(PrefPrefix + "FilterCutoff", receiver.filterMinCutoff);
-            PlayerPrefs.SetFloat(PrefPrefix + "PredMs", receiver.motionPredictionMs);
+            PlayerPrefs.SetFloat(PrefPrefix + "PdFreqHz", pdNaturalFrequencyHz);
+            PlayerPrefs.SetFloat(PrefPrefix + "KfVelNoise", receiver.kalmanProcessNoiseVel);
             PlayerPrefs.SetFloat(PrefPrefix + "HudScale", hudScale);
+            PlayerPrefs.SetInt(PrefPrefix + "ExpPreset", (int)experimentPreset);
             PlayerPrefs.SetInt(PrefPrefix + "ArmMode", (int)activeArmMode);
             PlayerPrefs.SetInt(PrefPrefix + "VisualStyle", (int)handVisualStyle);
 
@@ -452,18 +585,20 @@ namespace PsychophysicsVR.Tracking
 
             receiver.armScale = PlayerPrefs.GetFloat(PrefPrefix + "ArmScale", receiver.armScale);
             receiver.cameraYawOffsetDeg = PlayerPrefs.GetFloat(PrefPrefix + "CamYaw", receiver.cameraYawOffsetDeg);
+            receiver.continuousAutoCalibration = PlayerPrefs.GetInt(PrefPrefix + "AutoCalib", 1) == 1;
             shoulderOffsetFromHead = new Vector3(
                 PlayerPrefs.GetFloat(PrefPrefix + "ShoulderX", shoulderOffsetFromHead.x),
                 PlayerPrefs.GetFloat(PrefPrefix + "ShoulderY", shoulderOffsetFromHead.y),
                 PlayerPrefs.GetFloat(PrefPrefix + "ShoulderZ", shoulderOffsetFromHead.z)
             );
-            receiver.filterMinCutoff = PlayerPrefs.GetFloat(PrefPrefix + "FilterCutoff", receiver.filterMinCutoff);
-            receiver.motionPredictionMs = PlayerPrefs.GetFloat(PrefPrefix + "PredMs", receiver.motionPredictionMs);
+            pdNaturalFrequencyHz = PlayerPrefs.GetFloat(PrefPrefix + "PdFreqHz", pdNaturalFrequencyHz);
+            receiver.kalmanProcessNoiseVel = PlayerPrefs.GetFloat(PrefPrefix + "KfVelNoise", receiver.kalmanProcessNoiseVel);
             hudScale = PlayerPrefs.GetFloat(PrefPrefix + "HudScale", hudScale);
+            experimentPreset = (ExperimentPreset)PlayerPrefs.GetInt(PrefPrefix + "ExpPreset", (int)experimentPreset);
             activeArmMode = (ActiveArmMode)PlayerPrefs.GetInt(PrefPrefix + "ArmMode", (int)activeArmMode);
             handVisualStyle = (HandVisualStyle)PlayerPrefs.GetInt(PrefPrefix + "VisualStyle", (int)handVisualStyle);
 
-            if (PlayerPrefs.GetInt(PrefPrefix + "HasHandle", 0) == 1)
+            if (PlayerPrefs.GetInt(PrefPrefix + "HasHandle", 0) == 1 && experimentPreset == ExperimentPreset.StrengthMachineTask)
             {
                 EnsureHandleMarker();
                 machineHandleOrigin.position = new Vector3(
@@ -473,7 +608,27 @@ namespace PsychophysicsVR.Tracking
                 );
             }
 
-            _calibrationStatusMessage = $"Restored saved calibration (Scale={receiver.armScale:F2}x, Yaw={receiver.cameraYawOffsetDeg:F0}°)";
+            CalibrationStatusMessage = $"Restored session (Yaw={receiver.cameraYawOffsetDeg:F0} deg, PD={pdNaturalFrequencyHz:F1} Hz)";
+        }
+
+        public void ResetCalibrationToDefaults()
+        {
+            PlayerPrefs.DeleteAll();
+            shoulderOffsetFromHead = new Vector3(0.18f, -0.15f, 0.00f);
+            pdNaturalFrequencyHz = 4.8f;
+            movementGain = 1.0f;
+            elbowFlexionOffsetDeg = 0f;
+            artificialDelayMs = 0f;
+            pseudoHapticDrag = 0f;
+            if (receiver != null)
+            {
+                receiver.armScale = 1.0f;
+                receiver.cameraYawOffsetDeg = 0f;
+                receiver.kalmanProcessNoiseVel = 2.8f;
+                receiver.continuousAutoCalibration = true;
+                receiver.ResetAutoCalibrationLock();
+            }
+            CalibrationStatusMessage = "Reset settings to factory defaults.";
         }
 
         private void OnDisable()
@@ -542,7 +697,7 @@ namespace PsychophysicsVR.Tracking
                 Vector3 restWrist = restElbow + camYaw * new Vector3(-0.06f * sideSign, 0.03f, 0.22f);
                 Vector3 restIndex = restWrist + camYaw * new Vector3(-0.02f * sideSign, 0.02f, 0.08f);
                 Vector3 restPinky = restWrist + camYaw * new Vector3(0.02f * sideSign, -0.02f, 0.08f);
-                SolveAnatomicalTrigonometricIK(rig, sPos, restElbow, restWrist, restIndex, restPinky, restWrist);
+                SolveCriticallyDampedTrigonometricIK(rig, sPos, restElbow, restWrist, restIndex, restPinky, restWrist);
                 UpdateArticulatedFingersAndMesh(rig, rig.HandBone.position, false, null);
                 return;
             }
@@ -564,8 +719,10 @@ namespace PsychophysicsVR.Tracking
             Vector3 targetElbow = sample.Elbow;
             Vector3 targetWrist = sample.Wrist;
 
-            // 1. Movement Gain Perturbation
-            Vector3 gainPivot = machineHandleOrigin != null ? machineHandleOrigin.position : targetShoulder;
+            // 1. Movement Gain Perturbation (uses CalibratedHandleOrigin in StrengthMachineTask, or Shoulder in GeneralFreeMovement)
+            Vector3 gainPivot = (experimentPreset == ExperimentPreset.StrengthMachineTask && machineHandleOrigin != null)
+                ? machineHandleOrigin.position
+                : targetShoulder;
             if (Mathf.Abs(movementGain - 1.0f) > 0.001f)
             {
                 targetWrist = gainPivot + (targetWrist - gainPivot) * movementGain;
@@ -597,8 +754,8 @@ namespace PsychophysicsVR.Tracking
                 targetWrist = targetElbow + rotOffset * (targetWrist - targetElbow);
             }
 
-            // 4. Solve Cross-Product-Free Trigonometric IK with Impossible-Pose Filtering
-            SolveAnatomicalTrigonometricIK(rig, targetShoulder, targetElbow, targetWrist, sample.Index, sample.Pinky, wIn);
+            // 4. Solve CDSO PD Controlled Trigonometric IK with Smooth Sigmoid Anatomical Constraints
+            SolveCriticallyDampedTrigonometricIK(rig, targetShoulder, targetElbow, targetWrist, sample.Index, sample.Pinky, wIn);
 
             // 5. Update 21-Finger Hand & Continuous 3D Skinned Mesh
             UpdateArticulatedFingersAndMesh(rig, rig.HandBone.position, fingersTracked, handWorldIn);
@@ -623,13 +780,13 @@ namespace PsychophysicsVR.Tracking
         }
 
         /// <summary>
-        /// Cross-Product-Free Trigonometric Two-Bone IK with Biomechanical Impossible-Pose Filter:
-        ///   - Fixes the "elbow protruding backwards/wrong way when holding the VR headset at startup" bug!
-        ///   - Instead of rotating around a Cross-Product normal (which can invert 180 degrees when your hand
-        ///     is raised to put on the VR headset), we compute the perpendicular elbow direction `elbowPerpDir`
-        ///     directly and clamp it to the human anatomical lower-lateral hemisphere!
+        /// v6.0 Critically Damped Second-Order (CDSO) PD Trigonometric IK Solver:
+        ///   - Uses smooth C-infinity SoftMax/SoftMin anatomical constraints (zero hard-boundary teleport pops!).
+        ///   - Steps wrist trajectory and elbow swivel via closed-form Critically Damped PD Springs (zeta = 1.0),
+        ///     giving finite physical limb inertia that absorbs residual noise with zero overshoot.
+        ///   - Solves exact 3D Elbow position via cross-product-free trigonometry (`cos(A)*d_wrist + sin(A)*e_perp`).
         /// </summary>
-        private void SolveAnatomicalTrigonometricIK(
+        private void SolveCriticallyDampedTrigonometricIK(
             ProceduralArmRig rig,
             Vector3 shoulderPos, Vector3 elbowHint, Vector3 wristTarget,
             Vector3 indexPos, Vector3 pinkyPos, Vector3 rawWristForHandRot)
@@ -639,16 +796,15 @@ namespace PsychophysicsVR.Tracking
             float maxReach = (a + b) - 0.008f;
             float minReach = Mathf.Abs(a - b) + 0.03f;
             float sideSign = rig.IsRight ? 1f : -1f;
+            float dt = Mathf.Clamp(Time.unscaledDeltaTime, 0.001f, 0.05f);
 
             Quaternion headYaw = _vrCamera != null ? Quaternion.Euler(0f, _vrCamera.transform.eulerAngles.y, 0f) : Quaternion.identity;
             Quaternion invHeadYaw = Quaternion.Inverse(headYaw);
 
-            // --- 1. Filter Anatomically Impossible Wrist Positions (e.g. behind torso or inside neck/headset) ---
+            // --- 1. Smooth C-infinity Soft-Sigmoid Wrist Anatomical Bounds ---
             Vector3 localWristRelShoulder = invHeadYaw * (wristTarget - shoulderPos);
-            // A human seated at a machine cannot put their wrist 15cm behind their shoulder socket
-            if (localWristRelShoulder.z < -0.10f)
-                localWristRelShoulder.z = -0.10f;
-            // Detect if the user is currently holding/adjusting their Pimax VR headset on their face!
+            localWristRelShoulder.z = BiomechanicalMath.SoftMax(localWristRelShoulder.z, -0.10f, 30f);
+
             bool isHoldingHeadset = false;
             if (_vrCamera != null)
             {
@@ -658,55 +814,33 @@ namespace PsychophysicsVR.Tracking
                     isHoldingHeadset = true;
                 }
             }
-            wristTarget = shoulderPos + headYaw * localWristRelShoulder;
+            Vector3 boundedWristTarget = shoulderPos + headYaw * localWristRelShoulder;
 
-            // --- 2. State-Informed Continuity on Wrist & Elbow ---
+            // --- 2. Critically Damped Second-Order (CDSO) PD Spring on Wrist Trajectory ---
             if (!rig.PoseInitialized)
             {
-                rig.PrevWristTarget = wristTarget;
-                rig.PrevElbowHint = elbowHint;
+                rig.WristSpring.Snap(boundedWristTarget);
                 rig.PoseInitialized = true;
             }
-            else
-            {
-                float maxStep = 4.5f * Mathf.Max(Time.deltaTime, 0.004f);
-                Vector3 wDelta = wristTarget - rig.PrevWristTarget;
-                if (wDelta.magnitude > maxStep)
-                    wristTarget = rig.PrevWristTarget + wDelta.normalized * maxStep;
+            Vector3 smoothedWrist = rig.WristSpring.Step(boundedWristTarget, dt, pdNaturalFrequencyHz);
 
-                float rawDist = Vector3.Distance(shoulderPos, wristTarget);
-                float extensionFactor = Mathf.InverseLerp(maxReach * 0.78f, maxReach, rawDist);
-                float wristBlend = Mathf.Lerp(0.82f, 0.45f, extensionFactor);
-                wristTarget = Vector3.Lerp(rig.PrevWristTarget, wristTarget, wristBlend);
-                elbowHint = Vector3.Lerp(rig.PrevElbowHint, elbowHint, 0.65f);
-
-                rig.PrevWristTarget = wristTarget;
-                rig.PrevElbowHint = elbowHint;
-            }
-
-            Vector3 toWrist = wristTarget - shoulderPos;
+            Vector3 toWrist = smoothedWrist - shoulderPos;
             float c = Mathf.Clamp(toWrist.magnitude, minReach, maxReach);
             Vector3 dirToWrist = toWrist.sqrMagnitude > 0.0001f ? toWrist.normalized : (headYaw * Vector3.forward);
 
-            // Law of cosines for interior shoulder angle A (between dirToWrist and UpperArm)
             float cosAngleA = Mathf.Clamp((a * a + c * c - b * b) / (2f * a * c), -1f, 1f);
             float sinAngleA = Mathf.Sqrt(Mathf.Max(0f, 1f - cosAngleA * cosAngleA));
 
-            // --- 3. Filter Anatomically Impossible Elbow Positions ---
-            // Natural human elbow pole direction in torso space: downward (-Y), slightly outward (+-X), slightly back (-Z)
+            // --- 3. Smooth C-infinity Soft-Sigmoid Elbow Anatomical Constraints ---
             Vector3 anatomicalPoleWorld = (headYaw * new Vector3(0.38f * sideSign, -0.90f, -0.15f)).normalized;
 
             Vector3 localElbowRelShoulder = invHeadYaw * (elbowHint - shoulderPos);
-            // Clamp impossible upward elbow flip (elbow can never point above the shoulder when reaching forward/holding headset)
-            if (localElbowRelShoulder.y > -0.02f)
-                localElbowRelShoulder.y = -0.15f;
-            // Clamp impossible medial chest penetration (right elbow cannot cross 12cm to the left of right shoulder)
-            if (localElbowRelShoulder.x * sideSign < -0.10f)
-                localElbowRelShoulder.x = -0.10f * sideSign;
+            // Smoothly prevent upward elbow inversions & medial chest crossings with zero step discontinuities!
+            localElbowRelShoulder.y = BiomechanicalMath.SoftMin(localElbowRelShoulder.y, -0.03f, 18f);
+            localElbowRelShoulder.x = sideSign * BiomechanicalMath.SoftMax(localElbowRelShoulder.x * sideSign, -0.10f, 22f);
 
             Vector3 clampedObsElbowDir = (headYaw * localElbowRelShoulder).normalized;
 
-            // Compute component of observed elbow direction perpendicular to `dirToWrist`
             Vector3 obsPerp = clampedObsElbowDir - Vector3.Dot(clampedObsElbowDir, dirToWrist) * dirToWrist;
             Vector3 polePerp = anatomicalPoleWorld - Vector3.Dot(anatomicalPoleWorld, dirToWrist) * dirToWrist;
             if (polePerp.sqrMagnitude < 0.001f)
@@ -721,36 +855,30 @@ namespace PsychophysicsVR.Tracking
             else
             {
                 obsPerp.Normalize();
-                // If the observed perpendicular elbow direction is > 85 degrees away from the anatomical pole
-                // (e.g. inverted upward or inward from camera occlusion while holding VR headset), clamp it toward polePerp!
-                if (Vector3.Dot(obsPerp, polePerp) < 0.10f)
-                {
-                    obsPerp = Vector3.Slerp(obsPerp, polePerp, 0.75f).normalized;
-                }
+                // Continuous smooth sigmoid weight toward polePerp when approaching dorsal hyperextension
+                float dotPole = Vector3.Dot(obsPerp, polePerp);
+                float antiFlipBlend = Mathf.SmoothStep(0f, 0.80f, Mathf.InverseLerp(0.35f, -0.25f, dotPole));
+                obsPerp = Vector3.Slerp(obsPerp, polePerp, antiFlipBlend).normalized;
 
                 float reachRatio = c / maxReach;
                 float poleWeight = isHoldingHeadset
-                    ? 0.80f // When adjusting VR headset on face, keep elbow gracefully tucked downward!
-                    : Mathf.InverseLerp(0.76f, 0.96f, reachRatio);
+                    ? 0.80f
+                    : Mathf.SmoothStep(0f, 1f, Mathf.InverseLerp(0.75f, 0.96f, reachRatio));
 
                 targetElbowPerp = Vector3.Slerp(obsPerp, polePerp, poleWeight).normalized;
             }
 
-            // Smooth the perpendicular elbow direction & re-orthogonalize against dirToWrist
-            rig.SmoothedElbowPerpDir = Vector3.Slerp(
-                rig.SmoothedElbowPerpDir,
-                targetElbowPerp,
-                Mathf.Clamp01(Time.deltaTime * (boneRotationSmoothing * 0.65f))
-            );
-            rig.SmoothedElbowPerpDir -= Vector3.Dot(rig.SmoothedElbowPerpDir, dirToWrist) * dirToWrist;
-            if (rig.SmoothedElbowPerpDir.sqrMagnitude < 0.001f)
-                rig.SmoothedElbowPerpDir = polePerp;
-            rig.SmoothedElbowPerpDir.Normalize();
+            // CDSO PD Spring on Elbow Swivel Direction
+            Vector3 springPerp = rig.ElbowPerpSpring.Step(targetElbowPerp, dt, pdNaturalFrequencyHz * 0.85f);
+            springPerp -= Vector3.Dot(springPerp, dirToWrist) * dirToWrist;
+            if (springPerp.sqrMagnitude < 0.001f)
+                springPerp = polePerp;
+            rig.SmoothedElbowPerpDir = springPerp.normalized;
 
-            // --- 4. Direct Trigonometric IK Solution (Zero Cross-Product Sign Ambiguity!) ---
+            // --- 4. Direct Trigonometric IK Solution ---
             Vector3 ikElbowDir = (dirToWrist * cosAngleA + rig.SmoothedElbowPerpDir * sinAngleA).normalized;
             Vector3 ikElbowPos = shoulderPos + ikElbowDir * a;
-            Vector3 ikForearmDir = (wristTarget - ikElbowPos).normalized;
+            Vector3 ikForearmDir = (smoothedWrist - ikElbowPos).normalized;
             Vector3 bendPlaneNormal = Vector3.Cross(ikElbowDir, ikForearmDir);
             if (bendPlaneNormal.sqrMagnitude < 0.001f)
                 bendPlaneNormal = Vector3.Cross(rig.SmoothedElbowPerpDir, dirToWrist);
@@ -759,34 +887,36 @@ namespace PsychophysicsVR.Tracking
             Quaternion targetUpperRot = AlignBoneAxes(ikElbowDir, bendPlaneNormal);
             Quaternion targetForeRot = AlignBoneAxes(ikForearmDir, bendPlaneNormal);
 
-            // --- 5. Hand Orientation with Anatomical Wrist ROM Clamping ---
+            // --- 5. Hand Orientation with CDSO PD Spring & Anatomical Wrist ROM Clamping ---
             Vector3 rawHandFwd = ((indexPos + pinkyPos) * 0.5f - rawWristForHandRot);
             Vector3 targetHandFwd = rawHandFwd.sqrMagnitude > 0.0004f ? rawHandFwd.normalized : ikForearmDir;
             if (Vector3.Angle(ikForearmDir, targetHandFwd) > 70f)
             {
                 targetHandFwd = Vector3.RotateTowards(ikForearmDir, targetHandFwd, 70f * Mathf.Deg2Rad, 0f).normalized;
             }
-            rig.SmoothedHandForward = Vector3.Slerp(rig.SmoothedHandForward, targetHandFwd, Mathf.Clamp01(Time.deltaTime * boneRotationSmoothing)).normalized;
+            Vector3 smoothedHandFwd = rig.HandFwdSpring.Step(targetHandFwd, dt, pdNaturalFrequencyHz * 1.4f).normalized;
+            if (smoothedHandFwd.sqrMagnitude < 0.001f) smoothedHandFwd = ikForearmDir;
 
             Vector3 acrossKnuckles = rig.IsRight ? (indexPos - pinkyPos) : (pinkyPos - indexPos);
             Vector3 rawPalmNorm = acrossKnuckles.sqrMagnitude > 0.0002f
-                ? Vector3.Cross(rig.SmoothedHandForward, acrossKnuckles.normalized)
+                ? Vector3.Cross(smoothedHandFwd, acrossKnuckles.normalized)
                 : bendPlaneNormal;
             if (rawPalmNorm.sqrMagnitude < 0.001f) rawPalmNorm = bendPlaneNormal;
-            rig.SmoothedPalmNormal = Vector3.Slerp(rig.SmoothedPalmNormal, rawPalmNorm.normalized, Mathf.Clamp01(Time.deltaTime * boneRotationSmoothing)).normalized;
+            Vector3 smoothedPalmNorm = rig.PalmNormSpring.Step(rawPalmNorm.normalized, dt, pdNaturalFrequencyHz * 1.4f).normalized;
+            if (smoothedPalmNorm.sqrMagnitude < 0.001f) smoothedPalmNorm = bendPlaneNormal;
 
-            Quaternion targetHandRot = AlignBoneAxes(rig.SmoothedHandForward, rig.SmoothedPalmNormal);
+            Quaternion targetHandRot = AlignBoneAxes(smoothedHandFwd, smoothedPalmNorm);
 
-            float rotAlpha = Mathf.Clamp01(Time.deltaTime * boneRotationSmoothing);
-
+            // --- 6. Drive Bone Rotations via Critically Damped Quaternion PD Controllers ---
+            float rotFreq = pdNaturalFrequencyHz * 1.35f;
             rig.UpperArmBone.position = shoulderPos;
-            rig.UpperArmBone.rotation = Quaternion.Slerp(rig.UpperArmBone.rotation, targetUpperRot, rotAlpha);
+            rig.UpperArmBone.rotation = rig.UpperArmRotPD.Step(targetUpperRot, dt, rotFreq);
 
             rig.ForearmBone.position = ikElbowPos;
-            rig.ForearmBone.rotation = Quaternion.Slerp(rig.ForearmBone.rotation, targetForeRot, rotAlpha);
+            rig.ForearmBone.rotation = rig.ForearmRotPD.Step(targetForeRot, dt, rotFreq);
 
             rig.HandBone.position = ikElbowPos + ikForearmDir * b;
-            rig.HandBone.rotation = Quaternion.Slerp(rig.HandBone.rotation, targetHandRot, rotAlpha);
+            rig.HandBone.rotation = rig.HandRotPD.Step(targetHandRot, dt, rotFreq);
         }
 
         private void UpdateArticulatedFingersAndMesh(
@@ -813,7 +943,7 @@ namespace PsychophysicsVR.Tracking
             }
 
             rig.SmoothedFingerWorldPos[0] = ikWristWorldPos;
-            float fingerLerp = rig.FingersInitialized ? Mathf.Clamp01(Time.deltaTime * 38f) : 1f;
+            float fingerLerp = rig.FingersInitialized ? Mathf.Clamp01(Time.deltaTime * 40f) : 1f;
             rig.FingersInitialized = true;
 
             for (int i = 1; i < 21; i++)
@@ -821,26 +951,25 @@ namespace PsychophysicsVR.Tracking
                 rig.SmoothedFingerWorldPos[i] = Vector3.Lerp(rig.SmoothedFingerWorldPos[i], targetPts[i], fingerLerp);
             }
 
-            // A) Update Continuous 3D Skinned Hand & Arm Mesh (if in MicrosoftContinuousMesh or HumanSkinContinuousMesh mode)
             if (rig.ContinuousSkinnedMesh != null && rig.ContinuousSkinnedMesh.MeshObject.activeSelf)
             {
                 Vector3 bendNormal = Vector3.Cross(
                     (rig.ForearmBone.position - rig.UpperArmBone.position).normalized,
                     (ikWristWorldPos - rig.ForearmBone.position).normalized
                 );
-                if (bendNormal.sqrMagnitude < 0.001f) bendNormal = rig.SmoothedPalmNormal;
+                Vector3 palmNorm = rig.PalmNormSpring.Initialized ? rig.PalmNormSpring.Value.normalized : Vector3.up;
+                if (bendNormal.sqrMagnitude < 0.001f) bendNormal = palmNorm;
 
                 rig.ContinuousSkinnedMesh.UpdateMeshPose(
                     rig.UpperArmBone.position,
                     rig.ForearmBone.position,
                     ikWristWorldPos,
                     rig.SmoothedFingerWorldPos,
-                    rig.SmoothedPalmNormal,
+                    palmNorm,
                     bendNormal.normalized
                 );
             }
 
-            // B) Update Bubble-Joint Primitives (if in BubbleJoints mode)
             if (rig.BubblePrimitivesGroup != null && rig.BubblePrimitivesGroup.activeSelf)
             {
                 for (int i = 0; i < 21; i++)
@@ -887,7 +1016,6 @@ namespace PsychophysicsVR.Tracking
                 }
             }
 
-            // C) Update Custom Imported FBX Hand Rig if active
             if (handVisualStyle == HandVisualStyle.CustomRiggedPrefab && rig.CustomHandInstance != null)
             {
                 DriveCustomRiggedHand(rig);
@@ -898,6 +1026,7 @@ namespace PsychophysicsVR.Tracking
         {
             rig.CustomHandInstance.position = rig.SmoothedFingerWorldPos[0];
             rig.CustomHandInstance.rotation = rig.HandBone.rotation;
+            Vector3 palmNorm = rig.PalmNormSpring.Initialized ? rig.PalmNormSpring.Value.normalized : Vector3.up;
 
             for (int b = 0; b < 20; b++)
             {
@@ -909,7 +1038,7 @@ namespace PsychophysicsVR.Tracking
                 Vector3 dir = (rig.SmoothedFingerWorldPos[i1] - rig.SmoothedFingerWorldPos[i0]);
                 if (dir.sqrMagnitude > 0.00001f)
                 {
-                    bone.rotation = Quaternion.LookRotation(dir.normalized, rig.SmoothedPalmNormal);
+                    bone.rotation = Quaternion.LookRotation(dir.normalized, palmNorm);
                 }
             }
         }
@@ -928,7 +1057,6 @@ namespace PsychophysicsVR.Tracking
             bool isCustom = (handVisualStyle == HandVisualStyle.CustomRiggedPrefab && customPrefabTemplate != null);
             bool isContinuousMesh = !isBubble && !isCustom;
 
-            // Toggle Bubble Primitives vs Continuous 3D Skinned Mesh
             rig.UpperArmMesh.gameObject.SetActive(isBubble || isCustom);
             rig.ForearmMesh.gameObject.SetActive(isBubble || isCustom);
             rig.ElbowSphere.gameObject.SetActive(isBubble || isCustom);
@@ -945,7 +1073,6 @@ namespace PsychophysicsVR.Tracking
                 }
                 else
                 {
-                    // Sleek Microsoft MRTK / HoloLens Continuous 3D Hand Mesh finish
                     rig.ContinuousSkinnedMesh.SetStyle(new Color(0.88f, 0.93f, 0.98f), true);
                 }
             }
@@ -1024,54 +1151,71 @@ namespace PsychophysicsVR.Tracking
             GUI.matrix = Matrix4x4.TRS(Vector3.zero, Quaternion.identity, new Vector3(autoDpiScale, autoDpiScale, 1f));
 
             GUIStyle boxStyle = new GUIStyle(GUI.skin.box) { fontSize = 14, alignment = TextAnchor.UpperLeft };
-            GUIStyle labelStyle = new GUIStyle(GUI.skin.label) { fontSize = 14, richText = true };
-            GUIStyle btnStyle = new GUIStyle(GUI.skin.button) { fontSize = 14, fontStyle = FontStyle.Bold };
+            GUIStyle labelStyle = new GUIStyle(GUI.skin.label) { fontSize = 13, richText = true };
+            GUIStyle btnStyle = new GUIStyle(GUI.skin.button) { fontSize = 13, fontStyle = FontStyle.Bold };
 
-            GUILayout.BeginArea(new Rect(12, 12, 520, 425), boxStyle);
+            GUILayout.BeginArea(new Rect(12, 12, 540, 470), boxStyle);
 
             bool fingersOk = (activeArmMode == ActiveArmMode.LeftArmOnly) ? receiver.leftHandFingersTracked : receiver.handFingersTracked;
             string fingerBadge = fingersOk
-                ? "<color=#44FF66><b>21 FINGERS LOCKED</b></color>"
-                : "<color=#FFAA33><b>ARM LOCKED (Fingers Rest)</b></color>";
+                ? "<color=#44FF66><b>21 FINGERS</b></color>"
+                : "<color=#FFAA33><b>ARM ONLY</b></color>";
+            string autoBadge = receiver.continuousAutoCalibration
+                ? (receiver.autoCalibrationLocked ? "<color=#66EEFF><b>AUTO-LOCKED</b></color>" : "<color=#FFEE66><b>AUTO-ALIGNING</b></color>")
+                : "<color=#CCCCCC><b>MANUAL</b></color>";
 
-            GUILayout.Label($"<b>Pimax + RealSense D455C v5.0</b> | {fingerBadge}", labelStyle);
-            GUILayout.Label($"Status: <b>{_calibrationStatusMessage}</b>", labelStyle);
+            GUILayout.Label($"<b>Pimax + D455C v6.0 (Kalman + CDSO PD)</b> | {fingerBadge} | {autoBadge}", labelStyle);
+            GUILayout.Label($"Status: <b>{CalibrationStatusMessage}</b>", labelStyle);
+            GUILayout.Label("<color=#AADDFF>VR Controls: [A/X]=VR Menu | [B/Y]=Mesh | [Grip]=Arm | [Grip+Trigger]=Match Controller</color>", labelStyle);
 
+            GUILayout.BeginHorizontal();
             GUI.backgroundColor = _calibrationFlashTimer > 0f ? Color.green : new Color(0.15f, 0.85f, 1f);
-            if (GUILayout.Button("🎯 CALIBRATE & AUTO-SAVE SESSION (Press C or Space)", btnStyle, GUILayout.Height(38)))
+            if (GUILayout.Button("Calibrate Now (C)", btnStyle, GUILayout.Height(34)))
             {
                 PerformOneClickCalibration();
             }
+            GUI.backgroundColor = receiver.continuousAutoCalibration ? new Color(0.4f, 0.9f, 0.7f) : new Color(0.7f, 0.7f, 0.7f);
+            if (GUILayout.Button($"Auto-Align: {(receiver.continuousAutoCalibration ? "ON" : "OFF")}", btnStyle, GUILayout.Height(34)))
+            {
+                ToggleContinuousAutoCalibration();
+            }
+            GUILayout.EndHorizontal();
 
             GUILayout.BeginHorizontal();
             GUI.backgroundColor = new Color(0.95f, 0.78f, 0.25f);
-            if (GUILayout.Button($"🦾 ARM: {activeArmMode} (Press R)", btnStyle, GUILayout.Height(34)))
+            if (GUILayout.Button($"Arm: {activeArmMode} (R)", btnStyle, GUILayout.Height(30)))
             {
                 CycleArmMode();
             }
             GUI.backgroundColor = new Color(0.55f, 0.92f, 0.65f);
-            if (GUILayout.Button($"✋ MESH: {handVisualStyle} (Press M)", btnStyle, GUILayout.Height(34)))
+            if (GUILayout.Button($"Mesh: {handVisualStyle} (M)", btnStyle, GUILayout.Height(30)))
             {
                 CycleVisualStyle();
             }
             GUILayout.EndHorizontal();
+
+            GUI.backgroundColor = new Color(0.85f, 0.75f, 1f);
+            if (GUILayout.Button($"Experiment Task: {experimentPreset}", btnStyle, GUILayout.Height(28)))
+            {
+                CycleExperimentPreset();
+            }
             GUI.backgroundColor = Color.white;
 
             GUILayout.Space(4);
+            GUILayout.Label($"<b>PD Controller Freq: {pdNaturalFrequencyHz:F1} Hz</b> | <b>Kalman Vel Noise: {receiver.kalmanProcessNoiseVel:F1}</b>", labelStyle);
+            GUILayout.BeginHorizontal();
+            pdNaturalFrequencyHz = GUILayout.HorizontalSlider(pdNaturalFrequencyHz, 1.5f, 12.0f);
+            receiver.kalmanProcessNoiseVel = GUILayout.HorizontalSlider(receiver.kalmanProcessNoiseVel, 0.3f, 10.0f);
+            GUILayout.EndHorizontal();
+
             GUILayout.Label($"<b>Shoulder Height (Y): {shoulderOffsetFromHead.y:F2}m</b> | <b>Width (X): {shoulderOffsetFromHead.x:F2}m</b>", labelStyle);
             GUILayout.BeginHorizontal();
             shoulderOffsetFromHead.y = GUILayout.HorizontalSlider(shoulderOffsetFromHead.y, -0.35f, 0.05f);
             shoulderOffsetFromHead.x = GUILayout.HorizontalSlider(shoulderOffsetFromHead.x, 0.05f, 0.35f);
             GUILayout.EndHorizontal();
 
-            GUILayout.Label($"<b>Camera Horizontal Angle (Yaw): {receiver.cameraYawOffsetDeg:F0}°</b>", labelStyle);
+            GUILayout.Label($"<b>Camera Angle (Yaw): {receiver.cameraYawOffsetDeg:F0} deg</b>", labelStyle);
             receiver.cameraYawOffsetDeg = GUILayout.HorizontalSlider(receiver.cameraYawOffsetDeg, -180f, 180f);
-
-            GUILayout.Label($"<b>Speed Prediction: {receiver.motionPredictionMs:F0} ms</b> | <b>Filter Cutoff: {receiver.filterMinCutoff:F1} Hz</b>", labelStyle);
-            GUILayout.BeginHorizontal();
-            receiver.motionPredictionMs = GUILayout.HorizontalSlider(receiver.motionPredictionMs, 0f, 30f);
-            receiver.filterMinCutoff = GUILayout.HorizontalSlider(receiver.filterMinCutoff, 0.8f, 5.0f);
-            GUILayout.EndHorizontal();
 
             GUILayout.Label($"<b>Psychophysics Gain: {movementGain:F2}x</b> | <b>HUD Scale: {hudScale:F2}x</b>", labelStyle);
             GUILayout.BeginHorizontal();
@@ -1080,19 +1224,14 @@ namespace PsychophysicsVR.Tracking
             GUILayout.EndHorizontal();
 
             GUILayout.BeginHorizontal();
-            if (GUILayout.Button("💾 Save Settings Now", GUILayout.Height(26)))
+            if (GUILayout.Button("Save Settings", GUILayout.Height(26)))
             {
                 SavePersistentSettings();
-                _calibrationStatusMessage = "✅ Saved all current sliders to persistent memory!";
+                CalibrationStatusMessage = "Saved all current sliders to persistent memory!";
             }
-            if (GUILayout.Button("🔄 Reset Defaults", GUILayout.Height(26)))
+            if (GUILayout.Button("Reset Defaults", GUILayout.Height(26)))
             {
-                PlayerPrefs.DeleteAll();
-                shoulderOffsetFromHead = new Vector3(0.18f, -0.15f, 0.00f);
-                receiver.armScale = 1.0f;
-                receiver.cameraYawOffsetDeg = 0f;
-                movementGain = 1.0f;
-                _calibrationStatusMessage = "Reset settings to factory defaults.";
+                ResetCalibrationToDefaults();
             }
             GUILayout.EndHorizontal();
 
@@ -1121,10 +1260,8 @@ namespace PsychophysicsVR.Tracking
             rig.HandBone.SetParent(rig.ForearmBone, false);
             rig.HandBone.localPosition = new Vector3(0f, prototypeForearmLength, 0f);
 
-            // 1. Build Continuous Skinned 3D Mesh (Microsoft MRTK / Smooth Human Skin Mesh)
             rig.ContinuousSkinnedMesh = new ContinuousHandArmMesh(rig.RootGo.transform, $"{prefix}_Continuous_3D_HandArm_Mesh", isRight);
 
-            // 2. Build Classic Bubble-Joint Primitives Group
             Color skinColor = new Color(0.93f, 0.76f, 0.64f);
             Color jointColor = new Color(0.98f, 0.84f, 0.45f);
             Color tipColor = new Color(0.96f, 0.62f, 0.52f);

@@ -7,20 +7,26 @@ using UnityEngine;
 namespace PsychophysicsVR.Tracking
 {
     /// <summary>
-    /// Dual-Arm + Dual-21-Finger Receiver for Intel RealSense D455C + MediaPipe (v4.0).
-    /// Receives both Right and Left arms + both 21-joint hands simultaneously in a single
-    /// 656-byte UDP packet, applies kinematic-gated 1-Euro filtering, and anchors each arm
-    /// to its respective VR shoulder socket.
+    /// v6.0 Dual-Arm + Dual-21-Finger Receiver with Continuous 90/120Hz Kalman Prediction
+    /// and Background Torso-Axis Auto-Calibration.
+    /// Eliminates 30-60 Hz sample-and-hold judder by predicting joint states every VR frame
+    /// and updates measurements with adaptive confidence covariance when UDP packets arrive.
     /// </summary>
     public class RealSenseArmReceiver : MonoBehaviour
     {
         [Header("Network Settings")]
         public int udpPort = 5055;
 
-        [Header("Coordinate Calibration & Alignment")]
+        [Header("Coordinate Calibration & Continuous Auto-Alignment")]
         public Transform avatarShoulderAnchor;
         public Transform leftAvatarShoulderAnchor;
         public Transform cameraOrientationReference;
+
+        [Tooltip("When enabled, automatically aligns camera yaw & arm scale in the background from both shoulders—no manual per-user calibration required!")]
+        public bool continuousAutoCalibration = true;
+
+        [Tooltip("Total upper + forearm length of the Unity avatar in meters (used for auto-scaling).")]
+        public float avatarTargetTotalArmLength = 0.53f;
 
         [Tooltip("Horizontal angle offset (degrees) of the physical D455C camera relative to the user.")]
         [Range(-180f, 180f)]
@@ -32,16 +38,23 @@ namespace PsychophysicsVR.Tracking
         [Tooltip("Mirror X axis (keep true when the D455C camera is facing the user).")]
         public bool mirrorX = true;
 
-        [Header("Speed & State-Informed 1-Euro Filter Tuning")]
-        [Range(0.5f, 8.0f)]
-        public float filterMinCutoff = 2.2f;
+        [Header("Continuous-Discrete Kalman Filter Tuning")]
+        [Tooltip("Process velocity noise (higher = faster response to sudden acceleration, lower = smoother).")]
+        [Range(0.2f, 12.0f)]
+        public float kalmanProcessNoiseVel = 2.8f;
 
-        [Range(0.01f, 1.0f)]
-        public float filterBeta = 0.22f;
+        [Tooltip("Base measurement variance (higher = trusts Kalman model more over noisy sensor frames).")]
+        [Range(0.00002f, 0.005f)]
+        public float kalmanMeasurementNoiseBase = 0.00025f;
 
-        [Tooltip("Velocity Lead Prediction in milliseconds (10-15 ms gives snappy response without overshoot during long reaches).")]
-        [Range(0f, 35f)]
-        public float motionPredictionMs = 12f;
+        [Tooltip("Biomechanical velocity damping rate (1/s) during inter-frame prediction.")]
+        [Range(1.0f, 10.0f)]
+        public float kalmanVelocityDamping = 3.5f;
+
+        // Legacy fields kept serialized for compatibility
+        [HideInInspector] public float filterMinCutoff = 2.2f;
+        [HideInInspector] public float filterBeta = 0.22f;
+        [HideInInspector] public float motionPredictionMs = 12f;
 
         [Header("Live Telemetry (Read-Only)")]
         [Range(0f, 1f)] public float trackingConfidence;
@@ -52,8 +65,9 @@ namespace PsychophysicsVR.Tracking
         public float measuredRealArmLengthMeters;
         public int packetsReceivedCount;
         public int remotePythonArmMode = -1;
+        public bool autoCalibrationLocked;
 
-        // Right Arm filtered joint positions in Unity World Space
+        // Right Arm filtered joint positions in Unity World Space (updated at full VR frame rate)
         public Vector3 ShoulderPos { get; private set; }
         public Vector3 ElbowPos { get; private set; }
         public Vector3 WristPos { get; private set; }
@@ -69,7 +83,7 @@ namespace PsychophysicsVR.Tracking
         public Vector3 LeftPinkyPos { get; private set; }
         public readonly Vector3[] LeftHandLandmarksWorld = new Vector3[21];
 
-        // Un-rotated local vectors in Unity camera space (for calibration)
+        // Un-rotated local vectors in Unity camera space
         public Vector3 LocalShoulderToWrist { get; private set; }
         public Vector3 LocalLeftShoulderToWrist { get; private set; }
         public Vector3 LocalOppositeToActiveShoulder { get; private set; }
@@ -92,20 +106,25 @@ namespace PsychophysicsVR.Tracking
         private bool _hasDualArmPacket;
         private bool _newPacketAvailable;
 
-        // Right arm 1-Euro filters
-        private OneEuroFilterVector3 _relElbowFilter;
-        private OneEuroFilterVector3 _relWristFilter;
-        private OneEuroFilterVector3 _relIndexFilter;
-        private OneEuroFilterVector3 _relPinkyFilter;
-        private OneEuroFilterVector3 _chestAxisFilter;
+        // Continuous-Discrete 3D Kalman Filters (Right Arm)
+        private KalmanFilter3D _kalmanRelElbow;
+        private KalmanFilter3D _kalmanRelWrist;
+        private KalmanFilter3D _kalmanRelIndex;
+        private KalmanFilter3D _kalmanRelPinky;
+        private KalmanFilter3D _kalmanChestAxis;
         private readonly OneEuroFilterVector3[] _fingerFilters = new OneEuroFilterVector3[21];
+        private readonly Vector3[] _filteredHandRelOffsets = new Vector3[21];
 
-        // Left arm 1-Euro filters
-        private OneEuroFilterVector3 _leftRelElbowFilter;
-        private OneEuroFilterVector3 _leftRelWristFilter;
-        private OneEuroFilterVector3 _leftRelIndexFilter;
-        private OneEuroFilterVector3 _leftRelPinkyFilter;
+        // Continuous-Discrete 3D Kalman Filters (Left Arm)
+        private KalmanFilter3D _leftKalmanRelElbow;
+        private KalmanFilter3D _leftKalmanRelWrist;
+        private KalmanFilter3D _leftKalmanRelIndex;
+        private KalmanFilter3D _leftKalmanRelPinky;
         private readonly OneEuroFilterVector3[] _leftFingerFilters = new OneEuroFilterVector3[21];
+        private readonly Vector3[] _filteredLeftHandRelOffsets = new Vector3[21];
+
+        private int _autoCalibSampleCount;
+        private Camera _vrCam;
 
         private UdpClient _udpClient;
         private Thread _receiveThread;
@@ -113,21 +132,21 @@ namespace PsychophysicsVR.Tracking
 
         private void Awake()
         {
-            _relElbowFilter = new OneEuroFilterVector3(filterMinCutoff, filterBeta, 1.0f, 4.2f);
-            _relWristFilter = new OneEuroFilterVector3(filterMinCutoff, filterBeta, 1.0f, 5.5f);
-            _relIndexFilter = new OneEuroFilterVector3(filterMinCutoff, filterBeta, 1.0f, 6.0f);
-            _relPinkyFilter = new OneEuroFilterVector3(filterMinCutoff, filterBeta, 1.0f, 6.0f);
-            _chestAxisFilter = new OneEuroFilterVector3(1.2f, 0.04f, 1.0f, 2.0f);
+            _kalmanRelElbow = new KalmanFilter3D(kalmanProcessNoiseVel, kalmanMeasurementNoiseBase, kalmanVelocityDamping, 0.08f);
+            _kalmanRelWrist = new KalmanFilter3D(kalmanProcessNoiseVel * 1.25f, kalmanMeasurementNoiseBase, kalmanVelocityDamping, 0.10f);
+            _kalmanRelIndex = new KalmanFilter3D(kalmanProcessNoiseVel * 1.25f, kalmanMeasurementNoiseBase * 1.5f, kalmanVelocityDamping, 0.10f);
+            _kalmanRelPinky = new KalmanFilter3D(kalmanProcessNoiseVel * 1.25f, kalmanMeasurementNoiseBase * 1.5f, kalmanVelocityDamping, 0.10f);
+            _kalmanChestAxis = new KalmanFilter3D(0.4f, 0.002f, 4.0f, 0.05f);
 
-            _leftRelElbowFilter = new OneEuroFilterVector3(filterMinCutoff, filterBeta, 1.0f, 4.2f);
-            _leftRelWristFilter = new OneEuroFilterVector3(filterMinCutoff, filterBeta, 1.0f, 5.5f);
-            _leftRelIndexFilter = new OneEuroFilterVector3(filterMinCutoff, filterBeta, 1.0f, 6.0f);
-            _leftRelPinkyFilter = new OneEuroFilterVector3(filterMinCutoff, filterBeta, 1.0f, 6.0f);
+            _leftKalmanRelElbow = new KalmanFilter3D(kalmanProcessNoiseVel, kalmanMeasurementNoiseBase, kalmanVelocityDamping, 0.08f);
+            _leftKalmanRelWrist = new KalmanFilter3D(kalmanProcessNoiseVel * 1.25f, kalmanMeasurementNoiseBase, kalmanVelocityDamping, 0.10f);
+            _leftKalmanRelIndex = new KalmanFilter3D(kalmanProcessNoiseVel * 1.25f, kalmanMeasurementNoiseBase * 1.5f, kalmanVelocityDamping, 0.10f);
+            _leftKalmanRelPinky = new KalmanFilter3D(kalmanProcessNoiseVel * 1.25f, kalmanMeasurementNoiseBase * 1.5f, kalmanVelocityDamping, 0.10f);
 
             for (int i = 0; i < 21; i++)
             {
-                _fingerFilters[i] = new OneEuroFilterVector3(3.0f, 0.30f, 1.0f, 4.0f);
-                _leftFingerFilters[i] = new OneEuroFilterVector3(3.0f, 0.30f, 1.0f, 4.0f);
+                _fingerFilters[i] = new OneEuroFilterVector3(3.2f, 0.25f, 1.0f, 4.0f);
+                _leftFingerFilters[i] = new OneEuroFilterVector3(3.2f, 0.25f, 1.0f, 4.0f);
             }
 
             if (avatarShoulderAnchor == null)
@@ -138,24 +157,35 @@ namespace PsychophysicsVR.Tracking
 
         private void Start()
         {
+            _vrCam = Camera.main != null ? Camera.main : UnityEngine.Object.FindFirstObjectByType<Camera>();
             StartUdpReceiver();
         }
 
         private void OnValidate()
         {
-            UpdateFilterParams();
+            SyncKalmanParams();
         }
 
-        private void UpdateFilterParams()
+        private void SyncKalmanParams()
         {
-            if (_relElbowFilter != null)
-            {
-                _relElbowFilter.minCutoff = _relWristFilter.minCutoff = _relIndexFilter.minCutoff = _relPinkyFilter.minCutoff = filterMinCutoff;
-                _relElbowFilter.beta = _relWristFilter.beta = _relIndexFilter.beta = _relPinkyFilter.beta = filterBeta;
+            if (_kalmanRelElbow == null) return;
 
-                _leftRelElbowFilter.minCutoff = _leftRelWristFilter.minCutoff = _leftRelIndexFilter.minCutoff = _leftRelPinkyFilter.minCutoff = filterMinCutoff;
-                _leftRelElbowFilter.beta = _leftRelWristFilter.beta = _leftRelIndexFilter.beta = _leftRelPinkyFilter.beta = filterBeta;
-            }
+            ApplyKalmanTuning(_kalmanRelElbow, 1.0f);
+            ApplyKalmanTuning(_kalmanRelWrist, 1.25f);
+            ApplyKalmanTuning(_kalmanRelIndex, 1.25f);
+            ApplyKalmanTuning(_kalmanRelPinky, 1.25f);
+
+            ApplyKalmanTuning(_leftKalmanRelElbow, 1.0f);
+            ApplyKalmanTuning(_leftKalmanRelWrist, 1.25f);
+            ApplyKalmanTuning(_leftKalmanRelIndex, 1.25f);
+            ApplyKalmanTuning(_leftKalmanRelPinky, 1.25f);
+        }
+
+        private void ApplyKalmanTuning(KalmanFilter3D kf, float velMultiplier)
+        {
+            kf.processNoiseVel = kalmanProcessNoiseVel * velMultiplier;
+            kf.measurementNoiseBase = kalmanMeasurementNoiseBase;
+            kf.velocityDampingRate = kalmanVelocityDamping;
         }
 
         private Vector3 ConvertRealSenseToUnityLocal(Vector3 rsPt)
@@ -166,11 +196,18 @@ namespace PsychophysicsVR.Tracking
             return new Vector3(x, y, z);
         }
 
+        public void ResetAutoCalibrationLock()
+        {
+            _autoCalibSampleCount = 0;
+            autoCalibrationLocked = false;
+        }
+
         public void CalibrateArmScaleToAvatar(float avatarTotalArmLength)
         {
+            avatarTargetTotalArmLength = avatarTotalArmLength;
             if (measuredRealArmLengthMeters > 0.25f && avatarTotalArmLength > 0.1f)
             {
-                armScale = Mathf.Clamp(avatarTotalArmLength / measuredRealArmLengthMeters, 0.5f, 2.0f);
+                armScale = Mathf.Clamp(avatarTotalArmLength / measuredRealArmLengthMeters, 0.55f, 1.85f);
                 Debug.Log($"[RealSenseArmReceiver] Calibrated armScale = {armScale:F3} " +
                           $"(Real D455C arm = {measuredRealArmLengthMeters:F3}m, Avatar arm = {avatarTotalArmLength:F3}m)");
             }
@@ -178,7 +215,10 @@ namespace PsychophysicsVR.Tracking
 
         private void Update()
         {
-            UpdateFilterParams();
+            SyncKalmanParams();
+
+            if (_vrCam == null)
+                _vrCam = Camera.main;
 
             Vector3 s, e, w, idx, pky, oppS;
             Vector3 ls, le, lw, lidx, lpky;
@@ -213,11 +253,22 @@ namespace PsychophysicsVR.Tracking
 
             if (!hasNew && trackingConfidence <= 0f && leftTrackingConfidence <= 0f) return;
 
-            Quaternion baseRot = cameraOrientationReference != null ? cameraOrientationReference.rotation : Quaternion.identity;
-            Quaternion yawRot = Quaternion.Euler(0f, cameraYawOffsetDeg, 0f) * baseRot;
-            Vector3 worldRightShoulder = avatarShoulderAnchor != null ? avatarShoulderAnchor.position : transform.position;
-            Vector3 worldLeftShoulder = leftAvatarShoulderAnchor != null ? leftAvatarShoulderAnchor.position : worldRightShoulder + new Vector3(-0.34f, 0f, 0f);
+            float dt = Mathf.Clamp(Time.unscaledDeltaTime, 0.001f, 0.05f);
+            float now = Time.unscaledTime;
 
+            // --- 1. Predict Continuously at 90/120 Hz VR Frame Rate (Zero Sample-and-Hold Staircase!) ---
+            _kalmanRelElbow.Predict(dt);
+            _kalmanRelWrist.Predict(dt);
+            _kalmanRelIndex.Predict(dt);
+            _kalmanRelPinky.Predict(dt);
+            _kalmanChestAxis.Predict(dt);
+
+            _leftKalmanRelElbow.Predict(dt);
+            _leftKalmanRelWrist.Predict(dt);
+            _leftKalmanRelIndex.Predict(dt);
+            _leftKalmanRelPinky.Predict(dt);
+
+            // --- 2. Apply Adaptive Kalman Measurement Update When UDP Packet Arrives ---
             if (hasNew)
             {
                 packetsReceivedCount++;
@@ -234,30 +285,20 @@ namespace PsychophysicsVR.Tracking
                     measuredRealArmLengthMeters = Mathf.Lerp(
                         measuredRealArmLengthMeters <= 0.01f ? (realUpper + realFore) : measuredRealArmLengthMeters,
                         realUpper + realFore,
-                        0.12f
+                        0.10f
                     );
                 }
 
-                float now = Time.unscaledTime;
-                float predSec = motionPredictionMs * 0.001f;
+                // Right Arm Kalman measurement update
+                _kalmanRelElbow.UpdateMeasurement(e - s, conf);
+                _kalmanRelWrist.UpdateMeasurement(w - s, conf);
+                _kalmanRelIndex.UpdateMeasurement(idx - s, conf);
+                _kalmanRelPinky.UpdateMeasurement(pky - s, conf);
 
-                // --- 1. Process Right Arm ---
-                Vector3 filtRelElbow = _relElbowFilter.Filter(e - s, now, predSec);
-                Vector3 filtRelWrist = _relWristFilter.Filter(w - s, now, predSec);
-                Vector3 filtRelIndex = _relIndexFilter.Filter(idx - s, now, predSec * 0.5f);
-                Vector3 filtRelPinky = _relPinkyFilter.Filter(pky - s, now, predSec * 0.5f);
-
-                LocalShoulderToWrist = filtRelWrist;
                 if (oppS.sqrMagnitude > 0.01f)
                 {
-                    LocalOppositeToActiveShoulder = _chestAxisFilter.Filter(s - oppS, now, 0f);
+                    _kalmanChestAxis.UpdateMeasurement(s - oppS, conf);
                 }
-
-                ShoulderPos = worldRightShoulder;
-                ElbowPos = worldRightShoulder + yawRot * (filtRelElbow * armScale);
-                WristPos = worldRightShoulder + yawRot * (filtRelWrist * armScale);
-                IndexPos = worldRightShoulder + yawRot * (filtRelIndex * armScale);
-                PinkyPos = worldRightShoulder + yawRot * (filtRelPinky * armScale);
 
                 if (handActive)
                 {
@@ -265,29 +306,18 @@ namespace PsychophysicsVR.Tracking
                     {
                         for (int i = 0; i < 21; i++)
                         {
-                            Vector3 filtRelFinger = _fingerFilters[i].Filter(_rawHandRel[i], now, predSec * 0.3f);
-                            HandLandmarksWorld[i] = WristPos + yawRot * filtRelFinger;
+                            _filteredHandRelOffsets[i] = _fingerFilters[i].Filter(_rawHandRel[i], now, 0f);
                         }
                     }
-                    IndexPos = HandLandmarksWorld[5];
-                    PinkyPos = HandLandmarksWorld[17];
                 }
 
-                // --- 2. Process Left Arm ---
+                // Left Arm Kalman measurement update
                 if (hasDual)
                 {
-                    Vector3 lFiltRelElbow = _leftRelElbowFilter.Filter(le - ls, now, predSec);
-                    Vector3 lFiltRelWrist = _leftRelWristFilter.Filter(lw - ls, now, predSec);
-                    Vector3 lFiltRelIndex = _leftRelIndexFilter.Filter(lidx - ls, now, predSec * 0.5f);
-                    Vector3 lFiltRelPinky = _leftRelPinkyFilter.Filter(lpky - ls, now, predSec * 0.5f);
-
-                    LocalLeftShoulderToWrist = lFiltRelWrist;
-
-                    LeftShoulderPos = worldLeftShoulder;
-                    LeftElbowPos = worldLeftShoulder + yawRot * (lFiltRelElbow * armScale);
-                    LeftWristPos = worldLeftShoulder + yawRot * (lFiltRelWrist * armScale);
-                    LeftIndexPos = worldLeftShoulder + yawRot * (lFiltRelIndex * armScale);
-                    LeftPinkyPos = worldLeftShoulder + yawRot * (lFiltRelPinky * armScale);
+                    _leftKalmanRelElbow.UpdateMeasurement(le - ls, lConf);
+                    _leftKalmanRelWrist.UpdateMeasurement(lw - ls, lConf);
+                    _leftKalmanRelIndex.UpdateMeasurement(lidx - ls, lConf);
+                    _leftKalmanRelPinky.UpdateMeasurement(lpky - ls, lConf);
 
                     if (lHandActive)
                     {
@@ -295,38 +325,108 @@ namespace PsychophysicsVR.Tracking
                         {
                             for (int i = 0; i < 21; i++)
                             {
-                                Vector3 lFiltRelFinger = _leftFingerFilters[i].Filter(_rawLeftHandRel[i], now, predSec * 0.3f);
-                                LeftHandLandmarksWorld[i] = LeftWristPos + yawRot * lFiltRelFinger;
+                                _filteredLeftHandRelOffsets[i] = _leftFingerFilters[i].Filter(_rawLeftHandRel[i], now, 0f);
                             }
                         }
-                        LeftIndexPos = LeftHandLandmarksWorld[5];
-                        LeftPinkyPos = LeftHandLandmarksWorld[17];
                     }
                 }
+
+                // --- 3. Continuous Background Torso-Axis Auto-Calibration ---
+                if (continuousAutoCalibration && oppS.sqrMagnitude > 0.04f && conf > 0.55f)
+                {
+                    RunBackgroundAutoCalibration(dt);
+                }
+            }
+
+            // --- 4. Project Continuous Predicted Arm Positions Into Unity World Space Every Frame ---
+            Quaternion baseRot = cameraOrientationReference != null ? cameraOrientationReference.rotation : Quaternion.identity;
+            Quaternion yawRot = Quaternion.Euler(0f, cameraYawOffsetDeg, 0f) * baseRot;
+
+            Vector3 worldRightShoulder = avatarShoulderAnchor != null ? avatarShoulderAnchor.position : transform.position;
+            Vector3 worldLeftShoulder = leftAvatarShoulderAnchor != null ? leftAvatarShoulderAnchor.position : worldRightShoulder + new Vector3(-0.34f, 0f, 0f);
+
+            Vector3 predRelElbow = _kalmanRelElbow.Position;
+            Vector3 predRelWrist = _kalmanRelWrist.Position;
+            Vector3 predRelIndex = _kalmanRelIndex.Position;
+            Vector3 predRelPinky = _kalmanRelPinky.Position;
+
+            LocalShoulderToWrist = predRelWrist;
+            LocalOppositeToActiveShoulder = _kalmanChestAxis.Position;
+
+            ShoulderPos = worldRightShoulder;
+            ElbowPos = worldRightShoulder + yawRot * (predRelElbow * armScale);
+            WristPos = worldRightShoulder + yawRot * (predRelWrist * armScale);
+            IndexPos = worldRightShoulder + yawRot * (predRelIndex * armScale);
+            PinkyPos = worldRightShoulder + yawRot * (predRelPinky * armScale);
+
+            if (handFingersTracked)
+            {
+                for (int i = 0; i < 21; i++)
+                {
+                    HandLandmarksWorld[i] = WristPos + yawRot * _filteredHandRelOffsets[i];
+                }
+                IndexPos = HandLandmarksWorld[5];
+                PinkyPos = HandLandmarksWorld[17];
+            }
+
+            if (_leftKalmanRelWrist.Initialized)
+            {
+                Vector3 lPredElbow = _leftKalmanRelElbow.Position;
+                Vector3 lPredWrist = _leftKalmanRelWrist.Position;
+                Vector3 lPredIndex = _leftKalmanRelIndex.Position;
+                Vector3 lPredPinky = _leftKalmanRelPinky.Position;
+
+                LocalLeftShoulderToWrist = lPredWrist;
+
+                LeftShoulderPos = worldLeftShoulder;
+                LeftElbowPos = worldLeftShoulder + yawRot * (lPredElbow * armScale);
+                LeftWristPos = worldLeftShoulder + yawRot * (lPredWrist * armScale);
+                LeftIndexPos = worldLeftShoulder + yawRot * (lPredIndex * armScale);
+                LeftPinkyPos = worldLeftShoulder + yawRot * (lPredPinky * armScale);
+
+                if (leftHandFingersTracked)
+                {
+                    for (int i = 0; i < 21; i++)
+                    {
+                        LeftHandLandmarksWorld[i] = LeftWristPos + yawRot * _filteredLeftHandRelOffsets[i];
+                    }
+                    LeftIndexPos = LeftHandLandmarksWorld[5];
+                    LeftPinkyPos = LeftHandLandmarksWorld[17];
+                }
+            }
+        }
+
+        private void RunBackgroundAutoCalibration(float dt)
+        {
+            Vector3 chestRightXZ = new Vector3(_kalmanChestAxis.Position.x, 0f, _kalmanChestAxis.Position.z);
+            if (_vrCam == null || chestRightXZ.magnitude < 0.14f) return;
+
+            Vector3 vrRightXZ = new Vector3(_vrCam.transform.right.x, 0f, _vrCam.transform.right.z).normalized;
+            float rawChestAngle = Mathf.Atan2(chestRightXZ.x, chestRightXZ.z) * Mathf.Rad2Deg;
+            float targetRightAngle = Mathf.Atan2(vrRightXZ.x, vrRightXZ.z) * Mathf.Rad2Deg;
+            float targetYaw = Mathf.DeltaAngle(rawChestAngle, targetRightAngle);
+
+            _autoCalibSampleCount++;
+            if (_autoCalibSampleCount <= 30)
+            {
+                // Initial fast lock within the first ~1 second of seating
+                cameraYawOffsetDeg = Mathf.LerpAngle(cameraYawOffsetDeg, targetYaw, 0.15f);
+                if (measuredRealArmLengthMeters > 0.28f && avatarTargetTotalArmLength > 0.1f)
+                {
+                    float targetScale = Mathf.Clamp(avatarTargetTotalArmLength / measuredRealArmLengthMeters, 0.65f, 1.50f);
+                    armScale = Mathf.Lerp(armScale, targetScale, 0.12f);
+                }
+                if (_autoCalibSampleCount == 30)
+                    autoCalibrationLocked = true;
             }
             else
             {
-                if (avatarShoulderAnchor != null)
+                // Gentle background drift compensation (max 0.5 deg/sec so trials are never disrupted)
+                cameraYawOffsetDeg = Mathf.MoveTowardsAngle(cameraYawOffsetDeg, targetYaw, 0.5f * Mathf.Max(dt, 0.016f));
+                if (measuredRealArmLengthMeters > 0.28f && avatarTargetTotalArmLength > 0.1f)
                 {
-                    Vector3 delta = worldRightShoulder - ShoulderPos;
-                    ShoulderPos += delta;
-                    ElbowPos += delta;
-                    WristPos += delta;
-                    IndexPos += delta;
-                    PinkyPos += delta;
-                    for (int i = 0; i < 21; i++)
-                        HandLandmarksWorld[i] += delta;
-                }
-                if (leftAvatarShoulderAnchor != null)
-                {
-                    Vector3 lDelta = worldLeftShoulder - LeftShoulderPos;
-                    LeftShoulderPos += lDelta;
-                    LeftElbowPos += lDelta;
-                    LeftWristPos += lDelta;
-                    LeftIndexPos += lDelta;
-                    LeftPinkyPos += lDelta;
-                    for (int i = 0; i < 21; i++)
-                        LeftHandLandmarksWorld[i] += lDelta;
+                    float targetScale = Mathf.Clamp(avatarTargetTotalArmLength / measuredRealArmLengthMeters, 0.65f, 1.50f);
+                    armScale = Mathf.MoveTowards(armScale, targetScale, 0.01f * Mathf.Max(dt, 0.016f));
                 }
             }
         }
@@ -380,7 +480,6 @@ namespace PsychophysicsVR.Tracking
 
                         if (hasDual)
                         {
-                            // Floats 84..100 (byte offset 336..400)
                             ls = ConvertRealSenseToUnityLocal(ReadVec3(data, 336));
                             le = ConvertRealSenseToUnityLocal(ReadVec3(data, 348));
                             lw = ConvertRealSenseToUnityLocal(ReadVec3(data, 360));
@@ -424,7 +523,7 @@ namespace PsychophysicsVR.Tracking
 
                                 if (lHandAct)
                                 {
-                                    int lBaseOff = 404; // Float 101 * 4 bytes
+                                    int lBaseOff = 404;
                                     for (int i = 0; i < 21; i++)
                                     {
                                         _rawLeftHandRel[i] = ConvertRealSenseToUnityLocal(ReadVec3(data, lBaseOff + i * 12));

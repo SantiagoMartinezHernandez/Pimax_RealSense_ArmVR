@@ -63,6 +63,6 @@ echo.
 copy /Y "%SOURCE_DIR%\*.cs" "!TARGET_ASSETS!\"
 
 echo.
-echo [SUCCESS] All 5 C# scripts copied to "!TARGET_ASSETS!\"!
+echo [SUCCESS] All 6 C# scripts copied to "!TARGET_ASSETS!\"!
 echo Switch back to Unity (it will recompile automatically).
 pause

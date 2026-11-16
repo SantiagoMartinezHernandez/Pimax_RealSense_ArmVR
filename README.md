@@ -1,6 +1,6 @@
-# Pimax Crystal + Intel RealSense D455C VR Arm & 21-Finger Illusion System (v5.0)
+# Pimax Crystal + Intel RealSense D455C VR Arm & 21-Finger Illusion System (v6.0)
 
-Real-time, low-latency (<20 ms perceived delay) 3D upper-limb and 21-DOF finger embodiment in **Unity VR** using the **Pimax Crystal HMD**, **Intel RealSense D455C Stereo Depth Camera**, and **Google MediaPipe**. Engineered for seated psychophysics experiments on motor agency, proprioceptive drift, and pseudo-haptic force perception.
+Real-time, jitter-free 3D upper-limb and 21-DOF finger embodiment in **Unity VR** using the **Pimax Crystal HMD**, **Intel RealSense D455C Stereo Depth Camera**, and **Google MediaPipe**. Engineered for general seated psychophysics experiments (free reaching, strength-machine force illusions, and proprioceptive drift) with continuous 90/120 Hz Kalman prediction, Critically Damped Second-Order (CDSO) PD joint control, background torso auto-alignment, and an in-headset 3D VR controller dashboard.
 
 ---
 
@@ -9,13 +9,14 @@ Real-time, low-latency (<20 ms perceived delay) 3D upper-limb and 21-DOF finger 
 ```text
 Pimax_RealSense_ArmVR/
 ├── PythonTracker/
-│   ├── realsense_d455_arm_tracker.py   # D455C + MediaPipe Dual-Arm & 21-Finger UDP streamer (60 Hz)
+│   ├── realsense_d455_arm_tracker.py   # v6.0 Rigid-Link FK + 1D Torso-Depth Kalman D455C streamer
 │   ├── requirements.txt                # Python dependencies (pyrealsense2, mediapipe, opencv-python, numpy)
 │   └── run_tracker.bat                 # 1-Click Windows launcher (auto-installs packages & models)
 ├── UnityScripts/
-│   ├── OneEuroFilter.cs                # State-informed 1€ Filter with 12ms velocity lead prediction
-│   ├── RealSenseArmReceiver.cs         # Zero-backlog 660-byte UDP receiver & coordinate transformer
-│   ├── ArmAvatarController.cs          # Trigonometric IK, Impossible-Pose Filter, Perturbations & HUD
+│   ├── OneEuroFilter.cs                # Continuous 3D Kalman Filter, CDSO PD Springs & Sigmoid Math
+│   ├── RealSenseArmReceiver.cs         # 90/120Hz Kalman Predictor + Background Torso Auto-Alignment
+│   ├── ArmAvatarController.cs          # CDSO PD Trigonometric IK, Multi-Experiment Presets & HUD
+│   ├── VRDashboardAndController.cs     # In-Headset 3D World-Space VR Menu & Pimax Controller Raycast
 │   ├── ProceduralHandMeshBuilder.cs    # Continuous 3D Skinned Hand & Arm Mesh generator (MRTK/Skin)
 │   └── SetupSceneMenu.cs               # 1-Click Unity Editor Menu ("Psychophysics VR -> Auto-Setup")
 ├── copy_to_unity.bat                   # Portable Multi-PC script sync utility (auto-detects Unity path)
@@ -76,7 +77,7 @@ Once your new Unity project opens:
 
 ### Step 5: Sync Scripts (`copy_to_unity.bat`) & Run 1-Click Auto-Setup
 1. Double-click **`copy_to_unity.bat`** in your `Pimax_RealSense_ArmVR` folder.
-   - It will copy all 5 C# scripts (`OneEuroFilter.cs`, `RealSenseArmReceiver.cs`, `ArmAvatarController.cs`, `ProceduralHandMeshBuilder.cs`, and `SetupSceneMenu.cs`) directly into your Unity project's `Assets/` folder.
+   - It will copy all 6 C# scripts (`OneEuroFilter.cs`, `RealSenseArmReceiver.cs`, `ArmAvatarController.cs`, `VRDashboardAndController.cs`, `ProceduralHandMeshBuilder.cs`, and `SetupSceneMenu.cs`) directly into your Unity project's `Assets/` folder.
 2. Click back into the **Unity Editor** window (wait ~3 seconds for it to compile the scripts).
 3. Look at the **very top menu bar** of Unity (next to `File`, `Edit`, `Assets`, `GameObject`, `Component`) and click:
    **`Psychophysics VR` -> `Auto-Setup Arm Tracker Scene`**
@@ -93,13 +94,16 @@ Once your new Unity project opens:
 
 ---
 
-## 🎮 Live Keyboard Shortcuts & HUD Controls
+## 🎮 Live VR Controller, 3D Headset Menu & Keyboard Controls
 
-| Key / Button | Function |
+| Input (VR Controller / Keyboard) | Function |
 | :--- | :--- |
-| **`C`** or **`Space`** (in Unity) | **1-Click Calibration & Auto-Save:** Scales VR arm to your real D455C arm length, aligns camera horizontal angle (`Yaw`) using your chest axis, places the green handle marker, and saves to persistent memory (`PlayerPrefs`). |
-| **`M`** (in Unity) | **Cycle 3D Hand/Arm Model:** Switches live between **`MicrosoftContinuousMesh`** (Holo-White unified 3D mesh), **`HumanSkinContinuousMesh`** (Skin-toned unified 3D mesh), and **`BubbleJoints`** (High-contrast spheres + capsules). |
-| **`R`** (in Unity or Python) | **Cycle Active Arms:** Switches live between **`RightArmOnly`** ➔ **`LeftArmOnly`** ➔ **`BothArms`** (synced automatically between Python and Unity). |
-| **`V`** (in Python Window) | **Toggle Video Overlay Drawing:** Hides the OpenCV preview rendering to save an extra ~2 ms of CPU time during experimental trials. |
-| **`Q`** (in Python Window) | Cleanly stops the RealSense D455C pipeline and exits. |
+| **`A` / `X` Button** or **`Tab`** | **Show / Hide & Recenter 3D VR Dashboard** directly inside your Pimax headset! |
+| **Point + `Trigger`** | **Click any button** on the floating 3D VR Dashboard inside the headset. |
+| **`Grip + Trigger`** | **Match VR Controller Position:** Uses the Pimax controller's exact 3D coordinate as a golden reference to align camera yaw, arm scale, and shoulder offset simultaneously. |
+| **`B` / `Y` Button** or **`M`** | **Cycle 3D Hand/Arm Model:** Switches live between **`MicrosoftContinuousMesh`**, **`HumanSkinContinuousMesh`**, and **`BubbleJoints`**. |
+| **`Grip` Button** or **`R`** | **Cycle Active Arms:** Switches live between **`RightArmOnly`** ➔ **`LeftArmOnly`** ➔ **`BothArms`** (synced automatically between Python and Unity). |
+| **Controller `Thumbstick`** | **Live Adjustments:** Up/Down adjusts Shoulder Height (`Y`); Left/Right adjusts Force/Movement Gain (hold `Grip` + Left/Right to rotate Camera Yaw). |
+| **`C`** or **`Space`** (Keyboard) | **Manual Calibration Snapshot:** Forces immediate camera yaw + scale snapshot and saves to persistent memory (`PlayerPrefs`). *(Note: Continuous Background Auto-Alignment is ON by default so manual calibration is optional!)* |
+| **`V`** / **`Q`** (Python Window) | **`V`**: Toggle OpenCV video overlay drawing (saves ~2 ms/frame). **`Q`**: Quit tracker cleanly. |
 

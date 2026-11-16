@@ -1,18 +1,17 @@
 """
-Intel RealSense D455C + MediaPipe Arm & 21-Finger 3D Tracker (v4.1 - Zero Hand Lag!)
-====================================================================================
-Why v4.0 had hand cloud delay & how v4.1 fixes it completely:
-  - In MediaPipe HandLandmarker, setting `num_hands=2` when only 1 hand is raised forces
-    MediaPipe to re-run the heavy full-frame SSD Palm Detector on EVERY SINGLE FRAME looking
-    for the missing 2nd hand—causing huge queue lag on the hand cloud!
-  - In v4.1:
-    1. Restores `num_hands=1` for RIGHT ARM and LEFT ARM modes (so once your hand is seen,
-       MediaPipe skips the heavy Palm Detector completely and tracks your 21 fingers in ~3ms!).
-    2. Restores the `'r'` key in the Python window! Pressing `'r'` in Python cycles:
-         [RIGHT ARM] -> [LEFT ARM] -> [BOTH ARMS]
-       and automatically tells Unity which mode is active!
-    3. Keeps the Kinematic Prior & Bone-Length Stabilization on the arms so long reaches
-       and high lifts stay rock-solid and human-like.
+Intel RealSense D455C + MediaPipe Arm & 21-Finger 3D Tracker (v6.0 - Rigid-Link + Kalman)
+=========================================================================================
+Major Upgrades in v6.0:
+  1. Rigid-Link Forward Kinematics + 1D Torso-Depth Kalman Filtering:
+     - Replaces independent per-joint pixel-depth deprojection (which caused silhouette
+       depth spikes during 10cm arm movements) with a heavily damped 1D Kalman Filter on
+       the shoulder/torso depth (`11x11` foreground patch).
+     - Continuously estimates metric arm scale via slow Kalman updates when high-visibility
+       measurements are available, eliminating mandatory per-session scale calibration.
+     - Extracts smooth unit bone direction vectors for Upper Arm and Forearm and reconstructs
+       Elbow and Wrist strictly via Rigid-Link Forward Kinematics BEFORE updating velocities,
+       eliminating limit-cycle chatter.
+  2. Adaptive Single/Dual 21-Finger Hand Gate + Dual-Arm Streaming (660-byte UDP @ 60 Hz).
 """
 
 import os
@@ -165,29 +164,60 @@ def start_and_verify_first_frame(pipeline: rs.pipeline):
 
 class KinematicArmState:
     """
-    Maintains the previous 3D state of one arm (Shoulder, Elbow, Wrist, Index, Pinky)
-    and enforces biomechanical continuity during long/high reaches.
+    v6.0 Rigid-Link Forward Kinematics + 1D Torso-Depth Kalman Sensor Fusion.
+    Decouples torso depth estimation (slow 1D Kalman Filter on an 11x11 shoulder patch)
+    from rigid-link arm rotations (smooth unit bone vectors reconstructed via fixed-length
+    forward kinematics BEFORE velocity updates, preventing bone-clamp limit cycles).
     """
+    BASE_UPPER_LEN = 0.28
+    BASE_FORE_LEN = 0.25
+
     def __init__(self, is_right: bool):
         self.is_right = is_right
         self.indices = (12, 14, 16, 20, 18) if is_right else (11, 13, 15, 19, 17)
-        self.anchor_shoulder_z = 0.70
+
+        # 1D Kalman state for Torso/Shoulder depth (meters)
+        self.torso_z_est = 0.70
+        self.torso_z_var = 0.05
+        self.torso_z_q = 0.0002
+        self.torso_z_r = 0.015
+
+        # 1D Kalman state for continuous metric arm scale (eliminates manual scale calibration)
+        self.est_arm_scale = 1.0
+        self.arm_scale_var = 0.04
+        self.arm_scale_q = 0.00005
+        self.arm_scale_r = 0.02
+
+        # Smoothed relative depth deltas for Elbow (0) and Wrist (1)
+        self.rel_z_smooth = [0.0, 0.0]
+
+        # Low-bandwidth 3D state for Shoulder in camera space
+        self.shoulder_cam_pos = None
+
+        # Unit bone direction vectors & kinematic state
+        self.prev_u_upper = None
+        self.prev_u_fore = None
         self.prev_pts = None
         self.prev_vel = [np.zeros(3, dtype=np.float32) for _ in range(5)]
         self.prev_time = None
-        self.est_upper_len = 0.28
-        self.est_fore_len = 0.25
 
     @staticmethod
-    def sample_depth(depth_image_raw: np.ndarray, depth_scale: float, u: int, v: int) -> float:
+    def sample_depth(depth_image_raw: np.ndarray, depth_scale: float, u: int, v: int, patch_radius: int = 3) -> float:
         h, w = depth_image_raw.shape
-        u0, u1 = max(0, u - 3), min(w, u + 4)
-        v0, v1 = max(0, v - 3), min(h, v + 4)
+        u0, u1 = max(0, u - patch_radius), min(w, u + patch_radius + 1)
+        v0, v1 = max(0, v - patch_radius), min(h, v + patch_radius + 1)
         patch = depth_image_raw[v0:v1, u0:u1]
         valid = patch[(patch > int(MIN_DEPTH_M / depth_scale)) & (patch < int(MAX_DEPTH_M / depth_scale))]
         if valid.size < 3:
             return 0.0
         return float(np.percentile(valid, 35)) * depth_scale
+
+    @staticmethod
+    def _normalize_vec(v: np.ndarray, fallback: np.ndarray) -> np.ndarray:
+        norm = float(np.linalg.norm(v))
+        if norm > 1e-5:
+            return (v / norm).astype(np.float32)
+        return fallback.copy()
 
     def update(self, norm_lms, world_lms, depth_image_raw: np.ndarray, depth_scale: float, intrinsics, now_sec: float):
         h, w = depth_image_raw.shape
@@ -195,97 +225,136 @@ class KinematicArmState:
         self.prev_time = now_sec
 
         px_coords = []
-        raw_depths = []
         vis_list = []
-
         for idx in self.indices:
             lm = norm_lms[idx]
             u = int(np.clip(lm.x * w, 0, w - 1))
             v = int(np.clip(lm.y * h, 0, h - 1))
             px_coords.append((u, v))
             vis_list.append(float(lm.visibility))
-            raw_depths.append(self.sample_depth(depth_image_raw, depth_scale, u, v))
 
-        d_shoulder = raw_depths[0]
+        # 1. 1D Kalman Filter on Shoulder/Torso Depth using wider 11x11 patch (patch_radius=5)
+        u_s, v_s = px_coords[0]
+        d_shoulder = self.sample_depth(depth_image_raw, depth_scale, u_s, v_s, patch_radius=5)
+
+        self.torso_z_var += self.torso_z_q
         if MIN_DEPTH_M <= d_shoulder <= MAX_DEPTH_M:
-            delta_z = np.clip(d_shoulder - self.anchor_shoulder_z, -0.02, 0.02)
-            self.anchor_shoulder_z += 0.25 * delta_z
+            # Huber-bounded innovation so sudden arm/hand pass over shoulder never pulls torso depth
+            innov_z = float(np.clip(d_shoulder - self.torso_z_est, -0.05, 0.05))
+            r_adapt = self.torso_z_r / max(vis_list[0] ** 2, 0.15)
+            k_z = self.torso_z_var / (self.torso_z_var + r_adapt)
+            self.torso_z_est += k_z * innov_z
+            self.torso_z_var *= (1.0 - k_z)
 
+        # Deproject Shoulder at Kalman-filtered torso_z_est and apply low-bandwidth 3D state filter
+        s_deproj = np.array(
+            rs.rs2_deproject_pixel_to_point(intrinsics, [float(u_s), float(v_s)], float(self.torso_z_est)),
+            dtype=np.float32,
+        )
+        if self.shoulder_cam_pos is None:
+            self.shoulder_cam_pos = s_deproj.copy()
+        else:
+            s_diff = s_deproj - self.shoulder_cam_pos
+            s_dist = float(np.linalg.norm(s_diff))
+            max_s_step = MAX_SHOULDER_SPEED_MPS * dt
+            if s_dist > max_s_step and s_dist > 1e-5:
+                s_diff = s_diff * (max_s_step / s_dist)
+            self.shoulder_cam_pos = self.shoulder_cam_pos + 0.25 * s_diff
+
+        # 2. Elbow (k=1) & Wrist (k=2) Direction Estimation with Gentle Huber Depth Innovation
         s_mp = world_lms[self.indices[0]]
-        raw_pts_3d = []
-        depth_weights = []
+        raw_joint_pos = [self.shoulder_cam_pos]
+        depth_valid_flags = [MIN_DEPTH_M <= d_shoulder <= MAX_DEPTH_M, False, False]
 
-        for k, idx in enumerate(self.indices):
-            u, v = px_coords[k]
+        for k in (1, 2):
+            idx = self.indices[k]
+            u_k, v_k = px_coords[k]
             lm_w = world_lms[idx]
-            mp_rel_z = float(lm_w.z - s_mp.z)
-            expected_z = self.anchor_shoulder_z + mp_rel_z
-            d_m = raw_depths[k]
+            mp_rel_vec = np.array([lm_w.x - s_mp.x, lm_w.y - s_mp.y, lm_w.z - s_mp.z], dtype=np.float32)
+            mp_rel_z = float(mp_rel_vec[2])
 
-            if k in (0, 1, 2) and MIN_DEPTH_M <= d_m <= MAX_DEPTH_M:
-                diff = abs(d_m - expected_z)
-                w_sensor = 0.50 * float(np.exp(-(diff * diff) / (2.0 * 0.14 * 0.14)))
-                fused_z = w_sensor * d_m + (1.0 - w_sensor) * expected_z
-                depth_weights.append(w_sensor)
-            else:
-                fused_z = expected_z
-                depth_weights.append(0.0)
+            d_m = self.sample_depth(depth_image_raw, depth_scale, u_k, v_k, patch_radius=3)
+            expected_abs_z = self.torso_z_est + mp_rel_z
 
-            deproj = np.array(rs.rs2_deproject_pixel_to_point(intrinsics, [float(u), float(v)], float(fused_z)), dtype=np.float32)
-            if k == 0:
-                raw_pts_3d.append(deproj)
+            if MIN_DEPTH_M <= d_m <= MAX_DEPTH_M and abs(d_m - expected_abs_z) < 0.18:
+                # Gentle Huber-bounded innovation (max +-0.20 weight) into smoothed relative depth state
+                d_rel_meas = d_m - self.torso_z_est
+                innov_rel = float(np.clip(d_rel_meas - mp_rel_z, -0.06, 0.06))
+                target_rel_z = mp_rel_z + 0.20 * innov_rel
+                self.rel_z_smooth[k - 1] = 0.20 * target_rel_z + 0.80 * self.rel_z_smooth[k - 1]
+                depth_valid_flags[k] = True
             else:
-                mp_vec = np.array([lm_w.x - s_mp.x, lm_w.y - s_mp.y, lm_w.z - s_mp.z], dtype=np.float32)
-                cam_vec = deproj - raw_pts_3d[0]
-                blended_vec = 0.72 * cam_vec + 0.28 * mp_vec
-                raw_pts_3d.append(raw_pts_3d[0] + blended_vec)
+                self.rel_z_smooth[k - 1] = 0.20 * mp_rel_z + 0.80 * self.rel_z_smooth[k - 1]
+
+            fused_abs_z = max(MIN_DEPTH_M, self.torso_z_est + self.rel_z_smooth[k - 1])
+            cam_deproj = np.array(
+                rs.rs2_deproject_pixel_to_point(intrinsics, [float(u_k), float(v_k)], float(fused_abs_z)),
+                dtype=np.float32,
+            )
+            cam_rel_vec = cam_deproj - self.shoulder_cam_pos
+            # Blend 50% optical camera ray vector + 50% MediaPipe relative world vector
+            blended_rel_vec = 0.50 * cam_rel_vec + 0.50 * mp_rel_vec
+            raw_joint_pos.append(self.shoulder_cam_pos + blended_rel_vec)
+
+        raw_upper_vec = raw_joint_pos[1] - raw_joint_pos[0]
+        raw_fore_vec = raw_joint_pos[2] - raw_joint_pos[1]
+        raw_upper_len = float(np.linalg.norm(raw_upper_vec))
+        raw_fore_len = float(np.linalg.norm(raw_fore_vec))
+
+        # 3. Slow Kalman Estimate of Metric Arm Scale when visibility is high (> 0.65)
+        self.arm_scale_var += self.arm_scale_q
+        min_vis = min(vis_list[0], vis_list[1], vis_list[2])
+        if min_vis > 0.65 and 0.30 < (raw_upper_len + raw_fore_len) < 0.90:
+            meas_scale = (raw_upper_len + raw_fore_len) / (self.BASE_UPPER_LEN + self.BASE_FORE_LEN)
+            meas_scale = float(np.clip(meas_scale, 0.72, 1.35))
+            k_s = self.arm_scale_var / (self.arm_scale_var + self.arm_scale_r)
+            self.est_arm_scale += k_s * (meas_scale - self.est_arm_scale)
+            self.arm_scale_var *= (1.0 - k_s)
+
+        # 4. Extract Unit Bone Direction Vectors & Reconstruct via Rigid-Link Forward Kinematics
+        default_upper = np.array([0.15 if self.is_right else -0.15, -0.85, 0.40], dtype=np.float32)
+        default_upper = self._normalize_vec(default_upper, np.array([0.0, -1.0, 0.0], dtype=np.float32))
+        default_fore = np.array([0.0, -0.25, 0.95], dtype=np.float32)
+        default_fore = self._normalize_vec(default_fore, np.array([0.0, 0.0, 1.0], dtype=np.float32))
+
+        u_upper = self._normalize_vec(raw_upper_vec, self.prev_u_upper if self.prev_u_upper is not None else default_upper)
+        u_fore = self._normalize_vec(raw_fore_vec, self.prev_u_fore if self.prev_u_fore is not None else default_fore)
+
+        if self.prev_u_upper is None:
+            self.prev_u_upper = u_upper
+            self.prev_u_fore = u_fore
+        else:
+            vis_u = np.clip(0.5 * (vis_list[0] + vis_list[1]), 0.30, 1.0)
+            vis_f = np.clip(0.5 * (vis_list[1] + vis_list[2]), 0.30, 1.0)
+            self.prev_u_upper = self._normalize_vec((1.0 - 0.68 * vis_u) * self.prev_u_upper + (0.68 * vis_u) * u_upper, u_upper)
+            self.prev_u_fore = self._normalize_vec((1.0 - 0.72 * vis_f) * self.prev_u_fore + (0.72 * vis_f) * u_fore, u_fore)
+
+        len_upper = self.BASE_UPPER_LEN * self.est_arm_scale
+        len_fore = self.BASE_FORE_LEN * self.est_arm_scale
+
+        # Strictly rigid-link forward kinematics BEFORE updating velocity states (zero limit-cycle chatter!)
+        fk_shoulder = self.shoulder_cam_pos
+        fk_elbow = fk_shoulder + self.prev_u_upper * len_upper
+        fk_wrist = fk_elbow + self.prev_u_fore * len_fore
+
+        # Index (k=3) and Pinky (k=4) from MediaPipe relative wrist offsets anchored to fk_wrist
+        w_mp = world_lms[self.indices[2]]
+        i_mp = world_lms[self.indices[3]]
+        p_mp = world_lms[self.indices[4]]
+        fk_index = fk_wrist + np.array([i_mp.x - w_mp.x, i_mp.y - w_mp.y, i_mp.z - w_mp.z], dtype=np.float32)
+        fk_pinky = fk_wrist + np.array([p_mp.x - w_mp.x, p_mp.y - w_mp.y, p_mp.z - w_mp.z], dtype=np.float32)
+
+        fk_pts = [fk_shoulder, fk_elbow, fk_wrist, fk_index, fk_pinky]
 
         if self.prev_pts is None:
-            self.prev_pts = [pt.copy() for pt in raw_pts_3d]
+            self.prev_pts = [pt.copy() for pt in fk_pts]
         else:
-            max_speeds = [MAX_SHOULDER_SPEED_MPS, MAX_ELBOW_SPEED_MPS, MAX_WRIST_SPEED_MPS, MAX_WRIST_SPEED_MPS, MAX_WRIST_SPEED_MPS]
             for k in range(5):
-                predicted_pt = self.prev_pts[k] + self.prev_vel[k] * (dt * 0.6)
-                innovation = raw_pts_3d[k] - predicted_pt
-                dist = float(np.linalg.norm(innovation))
-                max_step = max_speeds[k] * dt
-
-                if dist > max_step and dist > 1e-5:
-                    innovation = innovation * (max_step / dist)
-
-                vis_gain = np.clip(vis_list[k], 0.25, 1.0)
-                alpha = 0.72 * vis_gain if k > 0 else 0.45
-                new_pt = self.prev_pts[k] + alpha * (predicted_pt + innovation - self.prev_pts[k])
-
-                self.prev_vel[k] = 0.6 * ((new_pt - self.prev_pts[k]) / dt) + 0.4 * self.prev_vel[k]
-                self.prev_pts[k] = new_pt
-
-        # Enforce Anatomical Bone-Length Stability
-        s_pt = self.prev_pts[0]
-        e_vec = self.prev_pts[1] - s_pt
-        w_vec = self.prev_pts[2] - self.prev_pts[1]
-        u_len = float(np.linalg.norm(e_vec))
-        f_len = float(np.linalg.norm(w_vec))
-
-        if 0.18 < u_len < 0.42:
-            self.est_upper_len = 0.96 * self.est_upper_len + 0.04 * u_len
-        if 0.16 < f_len < 0.38:
-            self.est_fore_len = 0.96 * self.est_fore_len + 0.04 * f_len
-
-        if u_len > 1e-4:
-            clamped_u = np.clip(u_len, self.est_upper_len * 0.88, self.est_upper_len * 1.12)
-            self.prev_pts[1] = s_pt + (e_vec / u_len) * clamped_u
-
-        if f_len > 1e-4:
-            clamped_f = np.clip(f_len, self.est_fore_len * 0.88, self.est_fore_len * 1.12)
-            old_wrist = self.prev_pts[2].copy()
-            self.prev_pts[2] = self.prev_pts[1] + (w_vec / f_len) * clamped_f
-            wrist_shift = self.prev_pts[2] - old_wrist
-            self.prev_pts[3] += wrist_shift
-            self.prev_pts[4] += wrist_shift
+                self.prev_vel[k] = 0.6 * ((fk_pts[k] - self.prev_pts[k]) / dt) + 0.4 * self.prev_vel[k]
+                self.prev_pts[k] = fk_pts[k]
 
         conf = (vis_list[0] + vis_list[1] + vis_list[2]) / 3.0
-        valid_ratio = sum(1.0 for w_s in depth_weights[:3] if w_s > 0.15) / 3.0
+        valid_ratio = sum(1.0 for flag in depth_valid_flags if flag) / 3.0
         return [pt.tolist() for pt in self.prev_pts], conf, valid_ratio, px_coords
 
 

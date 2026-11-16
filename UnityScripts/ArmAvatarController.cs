@@ -581,7 +581,7 @@ namespace PsychophysicsVR.Tracking
                     GameObject handleGo = GameObject.CreatePrimitive(PrimitiveType.Sphere);
                     handleGo.name = "CalibratedHandleOrigin";
                     Destroy(handleGo.GetComponent<Collider>());
-                    handleGo.transform.localScale = Vector3.one * 0.042f;
+                    handleGo.transform.localScale = Vector3.one * 0.024f;
                     ApplyColor(handleGo, new Color(0.1f, 0.95f, 0.3f));
                     machineHandleOrigin = handleGo.transform;
                 }
@@ -1563,9 +1563,9 @@ namespace PsychophysicsVR.Tracking
                 ? (receiver.autoCalibrationLocked ? "<color=#66EEFF><b>AUTO-LOCKED</b></color>" : "<color=#FFEE66><b>AUTO-ALIGNING</b></color>")
                 : "<color=#CCCCCC><b>MANUAL</b></color>";
 
-            GUILayout.Label($"<b>Pimax + D455C v6.4 (4-Stop 3D Procrustes + CDSO PD)</b> | {fingerBadge} | {autoBadge}", labelStyle);
+            GUILayout.Label($"<b>Pimax + D455C v6.5 (HMD-Anchored Ctrl + 2.8cm Precision)</b> | {fingerBadge} | {autoBadge}", labelStyle);
             GUILayout.Label($"Status: <b>{CalibrationStatusMessage}</b>", labelStyle);
-            GUILayout.Label("<color=#AADDFF>VR Menu [Tab / A / X]: 3s Gaze Hold Clicks | Ctrl: [B/Y]=Mesh [Grip]=Arm [Grip+Trig]=Match</color>", labelStyle);
+            GUILayout.Label("<color=#AADDFF>VR Menu [Tab / A / X]: 3s Gaze Hold | [F] Call Ctrl | [B/Y]=Mesh [Grip]=Arm</color>", labelStyle);
 
             GUILayout.BeginHorizontal();
             GUI.backgroundColor = _calibrationFlashTimer > 0f ? Color.green : new Color(0.15f, 0.85f, 1f);
@@ -1577,6 +1577,11 @@ namespace PsychophysicsVR.Tracking
             if (GUILayout.Button("4-Stop Hold Calib", btnStyle, GUILayout.Height(34)))
             {
                 GetComponent<VRDashboardAndController>()?.StartGuidedPathCalibrationPrompt();
+            }
+            GUI.backgroundColor = new Color(1.0f, 0.58f, 0.18f);
+            if (GUILayout.Button("Call Ctrl (F)", btnStyle, GUILayout.Height(34)))
+            {
+                GetComponent<VRDashboardAndController>()?.ForceCallControllerPosition();
             }
             GUI.backgroundColor = receiver.continuousAutoCalibration ? new Color(0.4f, 0.9f, 0.7f) : new Color(0.7f, 0.7f, 0.7f);
             if (GUILayout.Button($"Auto-Align: {(receiver.continuousAutoCalibration ? "ON" : "OFF")}", btnStyle, GUILayout.Height(34)))

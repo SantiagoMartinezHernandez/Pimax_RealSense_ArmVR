@@ -11,14 +11,16 @@ using UnityEngine.InputSystem.XR;
 namespace PsychophysicsVR.Tracking
 {
     /// <summary>
-    /// v6.4 In-Headset 3D World-Space VR Dashboard + User-Paced "4-Stop Move &amp; Hold Steady" Calibration
-    /// + Smooth Critically Damped Controller Wand Interpolation:
-    ///   - Replaces continuous moving curve with a 4-Stop Move &amp; Hold routine (works for Right, Left,
-    ///     and Both Arms), recording zero-velocity samples at 4 non-coplanar 3D stops so low laptop
-    ///     SLAM refresh rates introduce ZERO velocity-lag error.
-    ///   - Smooths 3D controller wand visuals with CriticallyDampedSpring3D (10 Hz) so wands look silky
-    ///     even when OpenXR updates at 15-20 Hz.
-    ///   - Hands-Free 3-Second Gaze-Dwell Auto-Click + Trigger / Mouse / Enter instant click.
+    /// v6.5 In-Headset 3D World-Space VR Dashboard + High-Precision 4-Stop Calibration
+    /// + HMD-Relative Controller Anchoring + Force-Call Controller Locator:
+    ///   - Anchors controller OpenXR poses directly relative to XRNode.CenterEye / HMD so room-origin
+    ///     offsets never make controllers disappear or off-shoot calibration.
+    ///   - Separates devicePosition from pointerPosition bindings to eliminate multi-binding jumps,
+    ///     and snaps springs on re-acquisition (>20 cm jump) to prevent overshoot.
+    ///   - Adds Force-Call / Ping Controller Position ([F] key, VR/Desktop button, or any controller
+    ///     button wake-up) with a 1.6s glowing locator flash.
+    ///   - Shrinks calibration target spheres to 2.8 cm (with 8 mm bullseye core) & wand tip to 1.6 cm
+    ///     with a tight 6.5 cm capture radius for higher spatial precision.
     /// </summary>
     public class VRDashboardAndController : MonoBehaviour
     {
@@ -84,6 +86,11 @@ namespace PsychophysicsVR.Tracking
         private const float StopGlideDuration = 0.75f;
         private const float StopHoldDuration = 1.20f;
         private const int TotalStops = 4;
+        private const float TargetOrbDiameter = 0.028f;
+        private const float TargetCaptureRadius = 0.065f;
+
+        private float _ctrlPingTimer;
+        private string _ctrlPingStatusMsg = "";
 
         private readonly List<TrajectoryCalibSample> _recordedSamples = new List<TrajectoryCalibSample>(1024);
         private readonly List<Vector3> _recordedRightOrbPositions = new List<Vector3>(1024);
@@ -108,7 +115,9 @@ namespace PsychophysicsVR.Tracking
         private class HandInputActions
         {
             public InputAction PosAction;
+            public InputAction FallbackPosAction;
             public InputAction RotAction;
+            public InputAction FallbackRotAction;
             public InputAction TriggerAction;
             public InputAction GripAction;
             public InputAction PrimaryAction;
@@ -119,13 +128,15 @@ namespace PsychophysicsVR.Tracking
             {
                 PosAction = new InputAction($"{handTag}_Pos", InputActionType.Value, expectedControlType: "Vector3");
                 PosAction.AddBinding($"<XRController>{{{handTag}}}/devicePosition");
-                PosAction.AddBinding($"<XRController>{{{handTag}}}/pointerPosition");
-                PosAction.AddBinding($"<XRController>{{{handTag}}}/gripPosition");
+
+                FallbackPosAction = new InputAction($"{handTag}_FallbackPos", InputActionType.Value, expectedControlType: "Vector3");
+                FallbackPosAction.AddBinding($"<XRController>{{{handTag}}}/pointerPosition");
 
                 RotAction = new InputAction($"{handTag}_Rot", InputActionType.Value, expectedControlType: "Quaternion");
                 RotAction.AddBinding($"<XRController>{{{handTag}}}/deviceRotation");
-                RotAction.AddBinding($"<XRController>{{{handTag}}}/pointerRotation");
-                RotAction.AddBinding($"<XRController>{{{handTag}}}/gripRotation");
+
+                FallbackRotAction = new InputAction($"{handTag}_FallbackRot", InputActionType.Value, expectedControlType: "Quaternion");
+                FallbackRotAction.AddBinding($"<XRController>{{{handTag}}}/pointerRotation");
 
                 TriggerAction = new InputAction($"{handTag}_Trig", InputActionType.Button);
                 TriggerAction.AddBinding($"<XRController>{{{handTag}}}/triggerPressed");
@@ -146,7 +157,9 @@ namespace PsychophysicsVR.Tracking
             public void Enable()
             {
                 PosAction.Enable();
+                FallbackPosAction.Enable();
                 RotAction.Enable();
+                FallbackRotAction.Enable();
                 TriggerAction.Enable();
                 GripAction.Enable();
                 PrimaryAction.Enable();
@@ -157,7 +170,9 @@ namespace PsychophysicsVR.Tracking
             public void Disable()
             {
                 PosAction.Disable();
+                FallbackPosAction.Disable();
                 RotAction.Disable();
+                FallbackRotAction.Disable();
                 TriggerAction.Disable();
                 GripAction.Disable();
                 PrimaryAction.Disable();
@@ -168,7 +183,9 @@ namespace PsychophysicsVR.Tracking
             public void Dispose()
             {
                 PosAction.Dispose();
+                FallbackPosAction.Dispose();
                 RotAction.Dispose();
+                FallbackRotAction.Dispose();
                 TriggerAction.Dispose();
                 GripAction.Dispose();
                 PrimaryAction.Dispose();
@@ -264,6 +281,13 @@ namespace PsychophysicsVR.Tracking
             if (_dwellCooldownTimer > 0f)
                 _dwellCooldownTimer -= Time.unscaledDeltaTime;
 
+            if (_ctrlPingTimer > 0f)
+            {
+                _ctrlPingTimer -= Time.unscaledDeltaTime;
+                if (_ctrlPingTimer <= 0f)
+                    _ctrlPingStatusMsg = "";
+            }
+
             if (_flashTimer > 0f)
             {
                 _flashTimer -= Time.unscaledDeltaTime;
@@ -273,6 +297,11 @@ namespace PsychophysicsVR.Tracking
                     SetMaterialColor(_flashButton.BgRenderer.gameObject, restore);
                     _flashButton = null;
                 }
+            }
+
+            if (WasForceCallPressedThisFrame())
+            {
+                ForceCallControllerPosition();
             }
 
             if (WasTabPressedThisFrame())
@@ -289,6 +318,91 @@ namespace PsychophysicsVR.Tracking
 
             PollControllersAndUpdatePointer();
             RefreshDynamicButtonLabels();
+        }
+
+        /// <summary>
+        /// Force-calls (re-polls and immediately snaps) both VR controller poses relative to the HMD,
+        /// eliminating spring overshoot or stale tracking. If a controller is still asleep/occluded,
+        /// places a visible fallback reference marker in front of the user and triggers a 1.6s ping pulse.
+        /// </summary>
+        public void ForceCallControllerPosition()
+        {
+            if (_vrCam == null)
+                _vrCam = Camera.main != null ? Camera.main : UnityEngine.Object.FindFirstObjectByType<Camera>();
+
+#if ENABLE_INPUT_SYSTEM
+            InputSystem.Update();
+#endif
+            ControllerState right = ReadControllerState(isLeft: false);
+            ControllerState left = ReadControllerState(isLeft: true);
+
+            Quaternion headYaw = _vrCam != null ? Quaternion.Euler(0f, _vrCam.transform.eulerAngles.y, 0f) : Quaternion.identity;
+            Vector3 headPos = _vrCam != null ? _vrCam.transform.position : Vector3.zero;
+
+            if (right.Tracked)
+            {
+                _hasCachedRight = true;
+                _cachedRightPos = right.WorldPos;
+                _cachedRightRot = right.WorldRot;
+                _rightWandPosSpring.Snap(right.WorldPos);
+                _rightWandRotSpring.Snap(right.WorldRot);
+            }
+            else if (!_hasCachedRight && _vrCam != null)
+            {
+                _hasCachedRight = true;
+                _cachedRightPos = headPos + headYaw * new Vector3(0.16f, -0.22f, 0.42f);
+                _cachedRightRot = headYaw;
+                _rightWandPosSpring.Snap(_cachedRightPos);
+                _rightWandRotSpring.Snap(_cachedRightRot);
+            }
+            else if (_hasCachedRight)
+            {
+                _rightWandPosSpring.Snap(_cachedRightPos);
+                _rightWandRotSpring.Snap(_cachedRightRot);
+            }
+
+            if (left.Tracked)
+            {
+                _hasCachedLeft = true;
+                _cachedLeftPos = left.WorldPos;
+                _cachedLeftRot = left.WorldRot;
+                _leftWandPosSpring.Snap(left.WorldPos);
+                _leftWandRotSpring.Snap(left.WorldRot);
+            }
+            else if (!_hasCachedLeft && _vrCam != null)
+            {
+                _hasCachedLeft = true;
+                _cachedLeftPos = headPos + headYaw * new Vector3(-0.16f, -0.22f, 0.42f);
+                _cachedLeftRot = headYaw;
+                _leftWandPosSpring.Snap(_cachedLeftPos);
+                _leftWandRotSpring.Snap(_cachedLeftRot);
+            }
+            else if (_hasCachedLeft)
+            {
+                _leftWandPosSpring.Snap(_cachedLeftPos);
+                _leftWandRotSpring.Snap(_cachedLeftRot);
+            }
+
+            if (_rightCtrlMarker != null && _hasCachedRight)
+            {
+                _rightCtrlMarker.position = _cachedRightPos;
+                _rightCtrlMarker.rotation = _cachedRightRot;
+            }
+            if (_leftCtrlMarker != null && _hasCachedLeft)
+            {
+                _leftCtrlMarker.position = _cachedLeftPos;
+                _leftCtrlMarker.rotation = _cachedLeftRot;
+            }
+
+            _ctrlPingTimer = 1.6f;
+            if (right.Tracked && left.Tracked)
+                _ctrlPingStatusMsg = "PING: Both Controllers Snapped!";
+            else if (right.Tracked)
+                _ctrlPingStatusMsg = "PING: Right Ctrl Snapped (Left Cached)";
+            else if (left.Tracked)
+                _ctrlPingStatusMsg = "PING: Left Ctrl Snapped (Right Cached)";
+            else
+                _ctrlPingStatusMsg = "PING: No Live OpenXR Ctrl — Reference Placed!";
         }
 
         public void ToggleVRDashboard()
@@ -384,9 +498,20 @@ namespace PsychophysicsVR.Tracking
 
             if (right.Tracked)
             {
+                bool largeJump = !_hasCachedRight || Vector3.Distance(right.WorldPos, _cachedRightPos) > 0.20f;
                 _hasCachedRight = true;
                 _cachedRightPos = right.WorldPos;
                 _cachedRightRot = right.WorldRot;
+                if (largeJump)
+                {
+                    _rightWandPosSpring.Snap(right.WorldPos);
+                    _rightWandRotSpring.Snap(right.WorldRot);
+                    if (_rightCtrlMarker != null)
+                    {
+                        _rightCtrlMarker.position = right.WorldPos;
+                        _rightCtrlMarker.rotation = right.WorldRot;
+                    }
+                }
                 if (_hasPrevRawRight)
                 {
                     float instSpd = Vector3.Distance(right.WorldPos, _prevRawRightPos) / dt;
@@ -402,9 +527,20 @@ namespace PsychophysicsVR.Tracking
 
             if (left.Tracked)
             {
+                bool largeJump = !_hasCachedLeft || Vector3.Distance(left.WorldPos, _cachedLeftPos) > 0.20f;
                 _hasCachedLeft = true;
                 _cachedLeftPos = left.WorldPos;
                 _cachedLeftRot = left.WorldRot;
+                if (largeJump)
+                {
+                    _leftWandPosSpring.Snap(left.WorldPos);
+                    _leftWandRotSpring.Snap(left.WorldRot);
+                    if (_leftCtrlMarker != null)
+                    {
+                        _leftCtrlMarker.position = left.WorldPos;
+                        _leftCtrlMarker.rotation = left.WorldRot;
+                    }
+                }
                 if (_hasPrevRawLeft)
                 {
                     float instSpd = Vector3.Distance(left.WorldPos, _prevRawLeftPos) / dt;
@@ -563,11 +699,11 @@ namespace PsychophysicsVR.Tracking
                 Vector3 lStartWorld = _guidedArenaOriginPos + _guidedArenaHeadYaw * GetGuidedStopLocalPosition(0, isRight: false);
                 _rightTargetOrb.position = rStartWorld;
                 _leftTargetOrb.position = lStartWorld;
-                _rightTargetOrb.localScale = Vector3.one * 0.080f;
-                _leftTargetOrb.localScale = Vector3.one * 0.080f;
+                _rightTargetOrb.localScale = Vector3.one * TargetOrbDiameter;
+                _leftTargetOrb.localScale = Vector3.one * TargetOrbDiameter;
 
-                bool rInside = !needRight || Vector3.Distance(rMarkerPos, rStartWorld) < 0.16f;
-                bool lInside = !needLeft || Vector3.Distance(lMarkerPos, lStartWorld) < 0.16f;
+                bool rInside = !needRight || Vector3.Distance(rMarkerPos, rStartWorld) < TargetCaptureRadius;
+                bool lInside = !needLeft || Vector3.Distance(lMarkerPos, lStartWorld) < TargetCaptureRadius;
 
                 SetMaterialColor(_rightTargetOrb.gameObject, rInside ? Color.green : Color.cyan);
                 SetMaterialColor(_leftTargetOrb.gameObject, lInside ? Color.green : new Color(1f, 0.72f, 0.15f));
@@ -586,13 +722,13 @@ namespace PsychophysicsVR.Tracking
 
                 string holdHint = _orbHoldStartTimer > 0.1f
                     ? $"Ready! Starting Stop 1/4 in {Mathf.Max(0f, 1.2f - _orbHoldStartTimer):F1}s"
-                    : "Place inside Orb(s) OR press [A / X / Trigger / Space] to start!";
+                    : "Place tip inside 2.8cm Orb(s) OR press [A / X / Trigger / Space] to start!";
 
                 string sourceBadge = (rHasCtrl || lHasCtrl)
                     ? "6-DOF Controller Active"
                     : "Camera-Hand Mode (No VR Ctrl detected)";
 
-                _guidedBannerText.text = $"4-STOP MOVE & HOLD CALIBRATION ({sourceBadge})\nHold {armPrompt} at Stop 1/4\n{holdHint} ([B/Y] or [Tab] to cancel)";
+                _guidedBannerText.text = $"4-STOP MOVE & HOLD CALIBRATION ({sourceBadge})\nHold {armPrompt} at Stop 1/4\n{holdHint}\n([F] Force-Call Ctrl  |  [B/Y] or [Tab] Cancel)";
 
                 if (actionPressed || _orbHoldStartTimer >= 1.2f)
                 {
@@ -631,8 +767,8 @@ namespace PsychophysicsVR.Tracking
 
                 _rightTargetOrb.position = rPos;
                 _leftTargetOrb.position = lPos;
-                _rightTargetOrb.localScale = Vector3.one * 0.075f;
-                _leftTargetOrb.localScale = Vector3.one * 0.075f;
+                _rightTargetOrb.localScale = Vector3.one * TargetOrbDiameter;
+                _leftTargetOrb.localScale = Vector3.one * TargetOrbDiameter;
 
                 SetMaterialColor(_rightTargetOrb.gameObject, Color.cyan);
                 SetMaterialColor(_leftTargetOrb.gameObject, new Color(1f, 0.72f, 0.15f));
@@ -680,8 +816,8 @@ namespace PsychophysicsVR.Tracking
                     _manualForceCaptureActive = true;
                 }
 
-                bool rInside = !needRight || Vector3.Distance(rMarkerPos, rTargetWorld) < 0.18f;
-                bool lInside = !needLeft || Vector3.Distance(lMarkerPos, lTargetWorld) < 0.18f;
+                bool rInside = !needRight || Vector3.Distance(rMarkerPos, rTargetWorld) < TargetCaptureRadius;
+                bool lInside = !needLeft || Vector3.Distance(lMarkerPos, lTargetWorld) < TargetCaptureRadius;
                 bool rSteady = !needRight || !rHasCtrl || (_rightCtrlSpeed < 0.25f);
                 bool lSteady = !needLeft || !lHasCtrl || (_leftCtrlSpeed < 0.25f);
 
@@ -691,7 +827,7 @@ namespace PsychophysicsVR.Tracking
                 {
                     _stopHoldTimer += Time.unscaledDeltaTime;
                     float prog = Mathf.Clamp01(_stopHoldTimer / StopHoldDuration);
-                    float pulse = 0.080f + 0.022f * Mathf.Sin(prog * Mathf.PI);
+                    float pulse = TargetOrbDiameter + 0.008f * Mathf.Sin(prog * Mathf.PI);
                     _rightTargetOrb.localScale = Vector3.one * pulse;
                     _leftTargetOrb.localScale = Vector3.one * pulse;
 
@@ -731,12 +867,12 @@ namespace PsychophysicsVR.Tracking
                 {
                     // Gently decay hold timer if user moves out before finishing
                     _stopHoldTimer = Mathf.Max(0f, _stopHoldTimer - Time.unscaledDeltaTime * 2f);
-                    _rightTargetOrb.localScale = Vector3.one * 0.075f;
-                    _leftTargetOrb.localScale = Vector3.one * 0.075f;
+                    _rightTargetOrb.localScale = Vector3.one * TargetOrbDiameter;
+                    _leftTargetOrb.localScale = Vector3.one * TargetOrbDiameter;
                     SetMaterialColor(_rightTargetOrb.gameObject, rInside ? Color.green : Color.cyan);
                     SetMaterialColor(_leftTargetOrb.gameObject, lInside ? Color.green : new Color(1f, 0.72f, 0.15f));
 
-                    _guidedBannerText.text = $"STOP {_currentStopIndex + 1}/{TotalStops}: {GetStopName(_currentStopIndex)}\nMove hand(s) inside the Orb(s) and hold steady\n(Or press [Trigger / A / X / Space] to capture here)";
+                    _guidedBannerText.text = $"STOP {_currentStopIndex + 1}/{TotalStops}: {GetStopName(_currentStopIndex)}\nMove tip inside 2.8cm Orb(s) and hold steady\n([Trigger / A / X / Space] Capture  |  [F] Force-Call Ctrl)";
                 }
 
                 UpdateTetherLine(_rightTetherLine, needRight, _rightCtrlMarker.position, rTargetWorld, rInside && rSteady);
@@ -979,6 +1115,10 @@ namespace PsychophysicsVR.Tracking
             {
                 Vector3 actPos = actions.PosAction.ReadValue<Vector3>();
                 Quaternion actRot = actions.RotAction.ReadValue<Quaternion>();
+                if (actPos.sqrMagnitude < 0.0001f && actions.FallbackPosAction != null)
+                    actPos = actions.FallbackPosAction.ReadValue<Vector3>();
+                if (actRot.x == 0f && actRot.y == 0f && actRot.z == 0f && actRot.w == 0f && actions.FallbackRotAction != null)
+                    actRot = actions.FallbackRotAction.ReadValue<Quaternion>();
                 if (actRot.x == 0f && actRot.y == 0f && actRot.z == 0f && actRot.w == 0f)
                     actRot = Quaternion.identity;
 
@@ -1054,8 +1194,58 @@ namespace PsychophysicsVR.Tracking
             return state;
         }
 
+        private bool TryGetHmdOpenXRPose(out Vector3 hmdPos, out Quaternion hmdRot)
+        {
+#if ENABLE_INPUT_SYSTEM
+            XRHMD hmd = InputSystem.GetDevice<XRHMD>();
+            if (hmd != null && hmd.added)
+            {
+                Vector3 pos = hmd.centerEyePosition != null ? hmd.centerEyePosition.ReadValue() : Vector3.zero;
+                if (pos.sqrMagnitude < 0.00001f && hmd.devicePosition != null)
+                    pos = hmd.devicePosition.ReadValue();
+                Quaternion rot = hmd.centerEyeRotation != null ? hmd.centerEyeRotation.ReadValue() : Quaternion.identity;
+                if (rot.x == 0f && rot.y == 0f && rot.z == 0f && rot.w == 0f && hmd.deviceRotation != null)
+                    rot = hmd.deviceRotation.ReadValue();
+                if (pos.sqrMagnitude > 0.00001f || (rot.x != 0f || rot.y != 0f || rot.z != 0f || rot.w != 0f))
+                {
+                    if (rot.x == 0f && rot.y == 0f && rot.z == 0f && rot.w == 0f) rot = Quaternion.identity;
+                    hmdPos = pos;
+                    hmdRot = rot;
+                    return true;
+                }
+            }
+#endif
+            UnityEngine.XR.InputDevice hmdDev = InputDevices.GetDeviceAtXRNode(XRNode.CenterEye);
+            if (!hmdDev.isValid)
+                hmdDev = InputDevices.GetDeviceAtXRNode(XRNode.Head);
+            if (hmdDev.isValid)
+            {
+                bool hasPos = hmdDev.TryGetFeatureValue(UnityEngine.XR.CommonUsages.centerEyePosition, out hmdPos)
+                           || hmdDev.TryGetFeatureValue(UnityEngine.XR.CommonUsages.devicePosition, out hmdPos);
+                bool hasRot = hmdDev.TryGetFeatureValue(UnityEngine.XR.CommonUsages.centerEyeRotation, out hmdRot)
+                           || hmdDev.TryGetFeatureValue(UnityEngine.XR.CommonUsages.deviceRotation, out hmdRot);
+                if (hasPos)
+                {
+                    if (!hasRot) hmdRot = Quaternion.identity;
+                    return true;
+                }
+            }
+
+            hmdPos = Vector3.zero;
+            hmdRot = Quaternion.identity;
+            return false;
+        }
+
         private void TransformLocalPoseToWorld(Vector3 localPos, Quaternion localRot, out Vector3 worldPos, out Quaternion worldRot)
         {
+            if (_vrCam != null && TryGetHmdOpenXRPose(out Vector3 hmdLocalPos, out Quaternion hmdLocalRot))
+            {
+                Quaternion yawAlign = Quaternion.Euler(0f, _vrCam.transform.eulerAngles.y - hmdLocalRot.eulerAngles.y, 0f);
+                worldPos = _vrCam.transform.position + yawAlign * (localPos - hmdLocalPos);
+                worldRot = yawAlign * localRot;
+                return;
+            }
+
             Transform xrOrigin = (_vrCam != null && _vrCam.transform.parent != null) ? _vrCam.transform.parent : null;
             if (xrOrigin != null)
             {
@@ -1111,6 +1301,18 @@ namespace PsychophysicsVR.Tracking
             return false;
         }
 
+        private static bool WasForceCallPressedThisFrame()
+        {
+#if ENABLE_INPUT_SYSTEM
+            if (Keyboard.current != null && Keyboard.current.fKey.wasPressedThisFrame)
+                return true;
+#endif
+#if ENABLE_LEGACY_INPUT_MANAGER
+            try { if (Input.GetKeyDown(KeyCode.F)) return true; } catch { }
+#endif
+            return false;
+        }
+
         private static bool WasManualClickPressedThisFrame()
         {
 #if ENABLE_INPUT_SYSTEM
@@ -1144,7 +1346,7 @@ namespace PsychophysicsVR.Tracking
                 return;
             }
 
-            if (!marker.gameObject.activeSelf)
+            if (!marker.gameObject.activeSelf || Vector3.Distance(marker.position, rawPos) > 0.20f)
             {
                 marker.gameObject.SetActive(true);
                 posSpring.Snap(rawPos);
@@ -1158,6 +1360,16 @@ namespace PsychophysicsVR.Tracking
                 marker.position = posSpring.Step(rawPos, dt, 10.0f);
                 marker.rotation = rotSpring.Step(rawRot, dt, 10.0f);
             }
+
+            if (_ctrlPingTimer > 0f)
+            {
+                float s = 1.0f + 0.45f * Mathf.Abs(Mathf.Sin(_ctrlPingTimer * 12f));
+                marker.localScale = Vector3.one * s;
+            }
+            else
+            {
+                marker.localScale = Vector3.one;
+            }
         }
 
         private void RefreshDynamicButtonLabels()
@@ -1168,13 +1380,15 @@ namespace PsychophysicsVR.Tracking
             {
                 string fStr = receiver.handFingersTracked ? "21-Fingers: ON" : "Arm Tracking";
                 string ctrlStr = _anyControllerTracked ? "VR Ctrl: ON" : "Gaze Mode (3s Hold)";
-                _headerText.text = $"PIMAX + D455C v6.4  |  {fStr}  |  {ctrlStr}";
+                _headerText.text = $"PIMAX + D455C v6.5  |  {fStr}  |  {ctrlStr}";
             }
             if (_statusText != null && controller != null)
             {
-                string hint = _anyControllerTracked
-                    ? "Controller: [A/X] Menu | [B/Y] Mesh | [Grip] Arm | [Grip+Trig] Quick Match"
-                    : "Tip: Add 'Oculus Touch Profile' in OpenXR Settings — OR Hold Gaze 3s to Click!";
+                string hint = !string.IsNullOrEmpty(_ctrlPingStatusMsg)
+                    ? _ctrlPingStatusMsg
+                    : (_anyControllerTracked
+                        ? "Controller: [A/X] Menu | [B/Y] Mesh | [Grip] Arm | [F] Call Ctrl"
+                        : "Tip: Press [F] / 'Locate Ctrl' if hidden — OR Hold Gaze 3s to Click!");
                 _statusText.text = $"{controller.CalibrationStatusMessage}\n{hint}";
             }
 
@@ -1208,15 +1422,17 @@ namespace PsychophysicsVR.Tracking
             _rightTargetOrb.name = "RightArmTargetOrb";
             Destroy(_rightTargetOrb.GetComponent<Collider>());
             _rightTargetOrb.SetParent(_guidedArenaRoot.transform, false);
-            _rightTargetOrb.localScale = Vector3.one * 0.075f;
+            _rightTargetOrb.localScale = Vector3.one * TargetOrbDiameter;
             SetMaterialColor(_rightTargetOrb.gameObject, Color.cyan);
+            CreateBullseyeCore(_rightTargetOrb, Color.white);
 
             _leftTargetOrb = GameObject.CreatePrimitive(PrimitiveType.Sphere).transform;
             _leftTargetOrb.name = "LeftArmTargetOrb";
             Destroy(_leftTargetOrb.GetComponent<Collider>());
             _leftTargetOrb.SetParent(_guidedArenaRoot.transform, false);
-            _leftTargetOrb.localScale = Vector3.one * 0.075f;
+            _leftTargetOrb.localScale = Vector3.one * TargetOrbDiameter;
             SetMaterialColor(_leftTargetOrb.gameObject, new Color(1f, 0.72f, 0.15f));
+            CreateBullseyeCore(_leftTargetOrb, Color.white);
 
             _rightPathPreviewLine = CreatePathPreviewLine("RightGuidedPathLine", new Color(0.2f, 0.85f, 1.0f, 0.5f));
             _leftPathPreviewLine = CreatePathPreviewLine("LeftGuidedPathLine", new Color(1.0f, 0.72f, 0.2f, 0.5f));
@@ -1232,6 +1448,16 @@ namespace PsychophysicsVR.Tracking
             _leftTetherLine.endWidth = 0.004f;
             _leftTetherLine.positionCount = 2;
             _leftTetherLine.enabled = false;
+        }
+
+        private static void CreateBullseyeCore(Transform parentOrb, Color coreColor)
+        {
+            GameObject core = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+            core.name = "BullseyeCore";
+            Destroy(core.GetComponent<Collider>());
+            core.transform.SetParent(parentOrb, false);
+            core.transform.localScale = Vector3.one * 0.285f; // ~8 mm inside 2.8 cm orb
+            SetMaterialColor(core, coreColor);
         }
 
         private LineRenderer CreatePathPreviewLine(string name, Color color)
@@ -1329,8 +1555,12 @@ namespace PsychophysicsVR.Tracking
                 new Color(0.25f, 0.30f, 0.40f), () => "Sh.Y +",
                 () => { if (controller != null) controller.shoulderOffsetFromHead.y = Mathf.Min(0.05f, controller.shoulderOffsetFromHead.y + 0.02f); });
 
-            CreateVRButton(new Vector3(0.0f, -0.240f, -0.010f), new Vector2(0.38f, 0.036f),
-                new Color(0.55f, 0.22f, 0.22f), () => "Hide VR Menu (A/X, Tab, or 3s Gaze)",
+            CreateVRButton(new Vector3(-0.14f, -0.240f, -0.010f), new Vector2(0.26f, 0.036f),
+                new Color(0.68f, 0.36f, 0.10f), () => "Locate / Call Ctrl (F)",
+                () => ForceCallControllerPosition());
+
+            CreateVRButton(new Vector3(0.14f, -0.240f, -0.010f), new Vector2(0.26f, 0.036f),
+                new Color(0.55f, 0.22f, 0.22f), () => "Hide Menu (A/X, Tab)",
                 () => ToggleVRDashboard());
 
             GameObject laserGo = new GameObject("VRLaserPointer");
@@ -1394,7 +1624,7 @@ namespace PsychophysicsVR.Tracking
             Destroy(ring.GetComponent<Collider>());
             ring.transform.SetParent(root.transform, false);
             ring.transform.localPosition = new Vector3(0f, 0.01f, 0.04f);
-            ring.transform.localScale = new Vector3(0.045f, 0.025f, 0.045f);
+            ring.transform.localScale = new Vector3(0.016f, 0.014f, 0.016f);
             SetMaterialColor(ring, col);
 
             root.SetActive(false);

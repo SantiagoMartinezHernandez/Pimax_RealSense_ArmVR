@@ -28,6 +28,25 @@ namespace PsychophysicsVR.Tracking
         ProprioceptiveDriftTask = 2
     }
 
+    public struct TrajectoryCalibSample
+    {
+        public float Timestamp;
+        public Vector3 HeadPos;
+        public Quaternion HeadYawRot;
+
+        public bool HasRight;
+        public Vector3 RightCamRelWrist;
+        public Vector3 RightCtrlWorldPos;
+        public Quaternion RightCtrlWorldRot;
+        public float RightConfidence;
+
+        public bool HasLeft;
+        public Vector3 LeftCamRelWrist;
+        public Vector3 LeftCtrlWorldPos;
+        public Quaternion LeftCtrlWorldRot;
+        public float LeftConfidence;
+    }
+
     /// <summary>
     /// v6.0 Dual-Arm + 21-Finger Articulated Hand Controller for Pimax VR Psychophysics.
     /// Upgrades in v6.0:
@@ -59,6 +78,10 @@ namespace PsychophysicsVR.Tracking
 
         [Tooltip("Right Shoulder offset from VR Headset (Eyes) in meters: X = Right (+0.18m), Y = Down (-0.15m), Z = Forward (0.00m).")]
         public Vector3 shoulderOffsetFromHead = new Vector3(0.18f, -0.15f, 0.00f);
+
+        [Tooltip("When true (set automatically by Guided Both-Arms Path Calibration), Left Shoulder uses its own calibrated 3D offset instead of mirroring Right Shoulder.")]
+        public bool hasIndependentLeftShoulder = false;
+        public Vector3 leftShoulderIndependentOffset = new Vector3(-0.18f, -0.15f, 0.00f);
 
         [Header("Arm Dimensions & CDSO PD Joint Controller")]
         public float prototypeUpperArmLength = 0.28f;
@@ -357,7 +380,9 @@ namespace PsychophysicsVR.Tracking
 
             if (receiver.leftAvatarShoulderAnchor != null)
             {
-                Vector3 leftOffset = new Vector3(-shoulderOffsetFromHead.x, shoulderOffsetFromHead.y, shoulderOffsetFromHead.z);
+                Vector3 leftOffset = hasIndependentLeftShoulder
+                    ? leftShoulderIndependentOffset
+                    : new Vector3(-shoulderOffsetFromHead.x, shoulderOffsetFromHead.y, shoulderOffsetFromHead.z);
                 receiver.leftAvatarShoulderAnchor.position = _vrCamera.transform.position + yawOnlyRot * leftOffset;
                 receiver.leftAvatarShoulderAnchor.rotation = yawOnlyRot;
             }
@@ -570,10 +595,16 @@ namespace PsychophysicsVR.Tracking
             PlayerPrefs.SetInt(PrefPrefix + "HasSaved", 1);
             PlayerPrefs.SetFloat(PrefPrefix + "ArmScale", receiver.armScale);
             PlayerPrefs.SetFloat(PrefPrefix + "CamYaw", receiver.cameraYawOffsetDeg);
+            PlayerPrefs.SetFloat(PrefPrefix + "CamPitch", receiver.cameraPitchOffsetDeg);
+            PlayerPrefs.SetFloat(PrefPrefix + "CamRoll", receiver.cameraRollOffsetDeg);
             PlayerPrefs.SetInt(PrefPrefix + "AutoCalib", receiver.continuousAutoCalibration ? 1 : 0);
             PlayerPrefs.SetFloat(PrefPrefix + "ShoulderX", shoulderOffsetFromHead.x);
             PlayerPrefs.SetFloat(PrefPrefix + "ShoulderY", shoulderOffsetFromHead.y);
             PlayerPrefs.SetFloat(PrefPrefix + "ShoulderZ", shoulderOffsetFromHead.z);
+            PlayerPrefs.SetInt(PrefPrefix + "HasIndepLeft", hasIndependentLeftShoulder ? 1 : 0);
+            PlayerPrefs.SetFloat(PrefPrefix + "LeftShoulderX", leftShoulderIndependentOffset.x);
+            PlayerPrefs.SetFloat(PrefPrefix + "LeftShoulderY", leftShoulderIndependentOffset.y);
+            PlayerPrefs.SetFloat(PrefPrefix + "LeftShoulderZ", leftShoulderIndependentOffset.z);
             PlayerPrefs.SetFloat(PrefPrefix + "PdFreqHz", pdNaturalFrequencyHz);
             PlayerPrefs.SetFloat(PrefPrefix + "KfVelNoise", receiver.kalmanProcessNoiseVel);
             PlayerPrefs.SetFloat(PrefPrefix + "HudScale", hudScale);
@@ -598,11 +629,19 @@ namespace PsychophysicsVR.Tracking
 
             receiver.armScale = PlayerPrefs.GetFloat(PrefPrefix + "ArmScale", receiver.armScale);
             receiver.cameraYawOffsetDeg = PlayerPrefs.GetFloat(PrefPrefix + "CamYaw", receiver.cameraYawOffsetDeg);
+            receiver.cameraPitchOffsetDeg = PlayerPrefs.GetFloat(PrefPrefix + "CamPitch", receiver.cameraPitchOffsetDeg);
+            receiver.cameraRollOffsetDeg = PlayerPrefs.GetFloat(PrefPrefix + "CamRoll", receiver.cameraRollOffsetDeg);
             receiver.continuousAutoCalibration = PlayerPrefs.GetInt(PrefPrefix + "AutoCalib", 1) == 1;
             shoulderOffsetFromHead = new Vector3(
                 PlayerPrefs.GetFloat(PrefPrefix + "ShoulderX", shoulderOffsetFromHead.x),
                 PlayerPrefs.GetFloat(PrefPrefix + "ShoulderY", shoulderOffsetFromHead.y),
                 PlayerPrefs.GetFloat(PrefPrefix + "ShoulderZ", shoulderOffsetFromHead.z)
+            );
+            hasIndependentLeftShoulder = PlayerPrefs.GetInt(PrefPrefix + "HasIndepLeft", 0) == 1;
+            leftShoulderIndependentOffset = new Vector3(
+                PlayerPrefs.GetFloat(PrefPrefix + "LeftShoulderX", leftShoulderIndependentOffset.x),
+                PlayerPrefs.GetFloat(PrefPrefix + "LeftShoulderY", leftShoulderIndependentOffset.y),
+                PlayerPrefs.GetFloat(PrefPrefix + "LeftShoulderZ", leftShoulderIndependentOffset.z)
             );
             pdNaturalFrequencyHz = PlayerPrefs.GetFloat(PrefPrefix + "PdFreqHz", pdNaturalFrequencyHz);
             receiver.kalmanProcessNoiseVel = PlayerPrefs.GetFloat(PrefPrefix + "KfVelNoise", receiver.kalmanProcessNoiseVel);
@@ -621,13 +660,15 @@ namespace PsychophysicsVR.Tracking
                 );
             }
 
-            CalibrationStatusMessage = $"Restored session (Yaw={receiver.cameraYawOffsetDeg:F0} deg, PD={pdNaturalFrequencyHz:F1} Hz)";
+            CalibrationStatusMessage = $"Restored session (YPR={receiver.cameraYawOffsetDeg:F0}/{receiver.cameraPitchOffsetDeg:F0}/{receiver.cameraRollOffsetDeg:F0}, PD={pdNaturalFrequencyHz:F1}Hz)";
         }
 
         public void ResetCalibrationToDefaults()
         {
             PlayerPrefs.DeleteAll();
             shoulderOffsetFromHead = new Vector3(0.18f, -0.15f, 0.00f);
+            hasIndependentLeftShoulder = false;
+            leftShoulderIndependentOffset = new Vector3(-0.18f, -0.15f, 0.00f);
             pdNaturalFrequencyHz = 4.8f;
             movementGain = 1.0f;
             elbowFlexionOffsetDeg = 0f;
@@ -637,6 +678,8 @@ namespace PsychophysicsVR.Tracking
             {
                 receiver.armScale = 1.0f;
                 receiver.cameraYawOffsetDeg = 0f;
+                receiver.cameraPitchOffsetDeg = 0f;
+                receiver.cameraRollOffsetDeg = 0f;
                 receiver.kalmanProcessNoiseVel = 2.8f;
                 receiver.continuousAutoCalibration = true;
                 receiver.ResetAutoCalibrationLock();
@@ -644,6 +687,320 @@ namespace PsychophysicsVR.Tracking
             if (_rightArmRig != null) _rightArmRig.CalibratedHandRotOffset = Quaternion.identity;
             if (_leftArmRig != null) _leftArmRig.CalibratedHandRotOffset = Quaternion.identity;
             CalibrationStatusMessage = "Reset settings to factory defaults.";
+        }
+
+        /// <summary>
+        /// v6.2 Multi-Point Lag-Compensated 3D Trajectory Solver (Procrustes + Polar Decomposition):
+        ///   Solves for:
+        ///     1. Temporal pipeline lag (0..4 frames) via rotation-invariant speed profile correlation.
+        ///     2. Full 3D Camera Orientation (Yaw, Pitch, Roll) + isotropic 3D Workspace Scale.
+        ///     3. Independent Right and Left 3D Shoulder Socket Offsets relative to Pimax Head Yaw.
+        ///     4. Averaged 6-DOF IMU Wrist Orientation Offset.
+        /// </summary>
+        public void SolveGuidedTrajectoryCalibration(List<TrajectoryCalibSample> samples)
+        {
+            if (receiver == null || samples == null || samples.Count < 25)
+            {
+                CalibrationStatusMessage = "Guided calibration cancelled: too few samples collected.";
+                return;
+            }
+
+            // 1. Estimate temporal pipeline lag (camera frames lagging behind 1000Hz controller)
+            int bestLag = 0;
+            float bestCorr = -1f;
+            int n = samples.Count;
+            for (int lag = 0; lag <= 4; lag++)
+            {
+                float dot = 0f, normCtrl = 0f, normCam = 0f;
+                for (int i = 0; i < n - 1 - lag; i++)
+                {
+                    if (samples[i].HasRight && samples[i + 1].HasRight && samples[i + lag].HasRight && samples[i + 1 + lag].HasRight)
+                    {
+                        float vc = (samples[i + 1].RightCtrlWorldPos - samples[i].RightCtrlWorldPos).magnitude;
+                        float vm = (samples[i + 1 + lag].RightCamRelWrist - samples[i + lag].RightCamRelWrist).magnitude;
+                        dot += vc * vm;
+                        normCtrl += vc * vc;
+                        normCam += vm * vm;
+                    }
+                    if (samples[i].HasLeft && samples[i + 1].HasLeft && samples[i + lag].HasLeft && samples[i + 1 + lag].HasLeft)
+                    {
+                        float vc = (samples[i + 1].LeftCtrlWorldPos - samples[i].LeftCtrlWorldPos).magnitude;
+                        float vm = (samples[i + 1 + lag].LeftCamRelWrist - samples[i + lag].LeftCamRelWrist).magnitude;
+                        dot += vc * vm;
+                        normCtrl += vc * vc;
+                        normCam += vm * vm;
+                    }
+                }
+                if (normCtrl > 1e-5f && normCam > 1e-5f)
+                {
+                    float corr = dot / Mathf.Sqrt(normCtrl * normCam);
+                    if (corr > bestCorr)
+                    {
+                        bestCorr = corr;
+                        bestLag = lag;
+                    }
+                }
+            }
+
+            Quaternion baseRot = receiver.cameraOrientationReference != null
+                ? receiver.cameraOrientationReference.rotation
+                : Quaternion.identity;
+
+            // 2. Collect time-aligned sample pairs weighted inversely by speed (waypoints anchor the geometry)
+            List<Vector3> rCamPts = new List<Vector3>(n);
+            List<Vector3> rWorldPts = new List<Vector3>(n);
+            List<float> rWeights = new List<float>(n);
+
+            List<Vector3> lCamPts = new List<Vector3>(n);
+            List<Vector3> lWorldPts = new List<Vector3>(n);
+            List<float> lWeights = new List<float>(n);
+
+            Vector3 rMeanCam = Vector3.zero, rMeanWorld = Vector3.zero;
+            float rWeightSum = 0f;
+            Vector3 lMeanCam = Vector3.zero, lMeanWorld = Vector3.zero;
+            float lWeightSum = 0f;
+
+            for (int i = 0; i < n - bestLag; i++)
+            {
+                TrajectoryCalibSample ctrlSample = samples[i];
+                TrajectoryCalibSample camSample = samples[i + bestLag];
+                float dtStep = (i > 0) ? Mathf.Max(0.005f, ctrlSample.Timestamp - samples[i - 1].Timestamp) : 0.016f;
+
+                if (ctrlSample.HasRight && camSample.HasRight && camSample.RightConfidence > 0.35f)
+                {
+                    float speed = (i > 0 && samples[i - 1].HasRight)
+                        ? (ctrlSample.RightCtrlWorldPos - samples[i - 1].RightCtrlWorldPos).magnitude / dtStep
+                        : 0f;
+                    float w = camSample.RightConfidence / (1.0f + 2.5f * speed * speed);
+
+                    Vector3 u = baseRot * camSample.RightCamRelWrist;
+                    // Subtract approximate head-rotated shoulder anchor to isolate torso-relative wrist movement in room space
+                    Vector3 approxShoulder = ctrlSample.HeadPos + ctrlSample.HeadYawRot * shoulderOffsetFromHead;
+                    Vector3 p = ctrlSample.RightCtrlWorldPos - approxShoulder;
+
+                    rCamPts.Add(u);
+                    rWorldPts.Add(p);
+                    rWeights.Add(w);
+                    rMeanCam += u * w;
+                    rMeanWorld += p * w;
+                    rWeightSum += w;
+                }
+
+                if (ctrlSample.HasLeft && camSample.HasLeft && camSample.LeftConfidence > 0.35f)
+                {
+                    float speed = (i > 0 && samples[i - 1].HasLeft)
+                        ? (ctrlSample.LeftCtrlWorldPos - samples[i - 1].LeftCtrlWorldPos).magnitude / dtStep
+                        : 0f;
+                    float w = camSample.LeftConfidence / (1.0f + 2.5f * speed * speed);
+
+                    Vector3 u = baseRot * camSample.LeftCamRelWrist;
+                    Vector3 approxLeftOffset = hasIndependentLeftShoulder
+                        ? leftShoulderIndependentOffset
+                        : new Vector3(-shoulderOffsetFromHead.x, shoulderOffsetFromHead.y, shoulderOffsetFromHead.z);
+                    Vector3 approxShoulder = ctrlSample.HeadPos + ctrlSample.HeadYawRot * approxLeftOffset;
+                    Vector3 p = ctrlSample.LeftCtrlWorldPos - approxShoulder;
+
+                    lCamPts.Add(u);
+                    lWorldPts.Add(p);
+                    lWeights.Add(w);
+                    lMeanCam += u * w;
+                    lMeanWorld += p * w;
+                    lWeightSum += w;
+                }
+            }
+
+            if (rWeightSum < 0.1f && lWeightSum < 0.1f)
+            {
+                CalibrationStatusMessage = "Guided calibration failed: no valid overlapping controller + camera pairs.";
+                return;
+            }
+
+            if (rWeightSum > 0.1f) { rMeanCam /= rWeightSum; rMeanWorld /= rWeightSum; }
+            if (lWeightSum > 0.1f) { lMeanCam /= lWeightSum; lMeanWorld /= lWeightSum; }
+
+            // 3. Solve Optimal Isotropic Scale `s` and 3D Camera Rotation `qCam` (Yaw, Pitch, Roll) via Polar Decomposition
+            float sumU2 = 0f, sumW2 = 0f;
+            Vector3 c0 = Vector3.zero, c1 = Vector3.zero, c2 = Vector3.zero;
+
+            for (int i = 0; i < rCamPts.Count; i++)
+            {
+                Vector3 uc = rCamPts[i] - rMeanCam;
+                Vector3 wc = rWorldPts[i] - rMeanWorld;
+                float w = rWeights[i];
+                sumU2 += w * uc.sqrMagnitude;
+                sumW2 += w * wc.sqrMagnitude;
+                c0 += wc * (w * uc.x);
+                c1 += wc * (w * uc.y);
+                c2 += wc * (w * uc.z);
+            }
+            for (int i = 0; i < lCamPts.Count; i++)
+            {
+                Vector3 uc = lCamPts[i] - lMeanCam;
+                Vector3 wc = lWorldPts[i] - lMeanWorld;
+                float w = lWeights[i];
+                sumU2 += w * uc.sqrMagnitude;
+                sumW2 += w * wc.sqrMagnitude;
+                c0 += wc * (w * uc.x);
+                c1 += wc * (w * uc.y);
+                c2 += wc * (w * uc.z);
+            }
+
+            float solvedScale = (sumU2 > 0.01f && sumW2 > 0.01f)
+                ? Mathf.Clamp(Mathf.Sqrt(sumW2 / sumU2), 0.65f, 1.50f)
+                : receiver.armScale;
+
+            Quaternion qCam = Quaternion.Euler(receiver.cameraPitchOffsetDeg, receiver.cameraYawOffsetDeg, receiver.cameraRollOffsetDeg);
+            for (int iter = 0; iter < 25; iter++)
+            {
+                Vector3 r0 = qCam * Vector3.right;
+                Vector3 r1 = qCam * Vector3.up;
+                Vector3 r2 = qCam * Vector3.forward;
+
+                float denom = Mathf.Abs(Vector3.Dot(r0, c0) + Vector3.Dot(r1, c1) + Vector3.Dot(r2, c2)) + 1e-6f;
+                Vector3 omega = (Vector3.Cross(r0, c0) + Vector3.Cross(r1, c1) + Vector3.Cross(r2, c2)) / denom;
+                float wAngle = omega.magnitude;
+                if (wAngle < 1e-5f) break;
+                qCam = (Quaternion.AngleAxis(wAngle * Mathf.Rad2Deg, omega / wAngle) * qCam).normalized;
+            }
+
+            Vector3 solvedEuler = qCam.eulerAngles;
+            float solvedPitch = Mathf.Clamp(NormalizeSignedAngle(solvedEuler.x), -35f, 35f);
+            float solvedYaw = NormalizeSignedAngle(solvedEuler.y);
+            float solvedRoll = Mathf.Clamp(NormalizeSignedAngle(solvedEuler.z), -35f, 35f);
+            qCam = Quaternion.Euler(solvedPitch, solvedYaw, solvedRoll);
+
+            receiver.armScale = solvedScale;
+            receiver.cameraYawOffsetDeg = solvedYaw;
+            receiver.cameraPitchOffsetDeg = solvedPitch;
+            receiver.cameraRollOffsetDeg = solvedRoll;
+
+            // 4. Solve Exact Right and Left 3D Shoulder Socket Offsets in Head-Yaw Space
+            Vector3 rShoulderSum = Vector3.zero, lShoulderSum = Vector3.zero;
+            float rShWeight = 0f, lShWeight = 0f;
+            float residualSum = 0f, residualWeight = 0f;
+
+            for (int i = 0; i < n - bestLag; i++)
+            {
+                TrajectoryCalibSample ctrlSample = samples[i];
+                TrajectoryCalibSample camSample = samples[i + bestLag];
+                Quaternion invHeadYaw = Quaternion.Inverse(ctrlSample.HeadYawRot);
+
+                if (ctrlSample.HasRight && camSample.HasRight && camSample.RightConfidence > 0.35f)
+                {
+                    Vector3 mappedOffset = qCam * ((baseRot * camSample.RightCamRelWrist) * solvedScale);
+                    Vector3 exactShoulderWorld = ctrlSample.RightCtrlWorldPos - mappedOffset;
+                    Vector3 exactLocalOffset = invHeadYaw * (exactShoulderWorld - ctrlSample.HeadPos);
+                    rShoulderSum += exactLocalOffset * camSample.RightConfidence;
+                    rShWeight += camSample.RightConfidence;
+                }
+                if (ctrlSample.HasLeft && camSample.HasLeft && camSample.LeftConfidence > 0.35f)
+                {
+                    Vector3 mappedOffset = qCam * ((baseRot * camSample.LeftCamRelWrist) * solvedScale);
+                    Vector3 exactShoulderWorld = ctrlSample.LeftCtrlWorldPos - mappedOffset;
+                    Vector3 exactLocalOffset = invHeadYaw * (exactShoulderWorld - ctrlSample.HeadPos);
+                    lShoulderSum += exactLocalOffset * camSample.LeftConfidence;
+                    lShWeight += camSample.LeftConfidence;
+                }
+            }
+
+            if (rShWeight > 0.1f)
+            {
+                Vector3 oR = rShoulderSum / rShWeight;
+                oR.x = Mathf.Clamp(oR.x, 0.06f, 0.32f);
+                oR.y = Mathf.Clamp(oR.y, -0.32f, -0.03f);
+                oR.z = Mathf.Clamp(oR.z, -0.20f, 0.20f);
+                shoulderOffsetFromHead = oR;
+                hasIndependentLeftShoulder = (lShWeight > 0.1f);
+            }
+
+            if (lShWeight > 0.1f)
+            {
+                Vector3 oL = lShoulderSum / lShWeight;
+                oL.x = Mathf.Clamp(oL.x, -0.32f, -0.06f);
+                oL.y = Mathf.Clamp(oL.y, -0.32f, -0.03f);
+                oL.z = Mathf.Clamp(oL.z, -0.20f, 0.20f);
+                if (rShWeight <= 0.1f)
+                {
+                    // Left-arm only mode: store mirrored X into main shoulderOffsetFromHead
+                    shoulderOffsetFromHead = new Vector3(-oL.x, oL.y, oL.z);
+                    hasIndependentLeftShoulder = false;
+                }
+                else
+                {
+                    // Both arms calibrated: lock independent Left Shoulder so bimanual midline matches to the mm!
+                    leftShoulderIndependentOffset = oL;
+                    hasIndependentLeftShoulder = true;
+                }
+            }
+
+            UpdateShoulderAnchorsFromHeadset();
+
+            // 5. Compute Residual 3D Error (cm) Across All Recorded Points for Researcher Verification
+            for (int i = 0; i < n - bestLag; i++)
+            {
+                TrajectoryCalibSample ctrlSample = samples[i];
+                TrajectoryCalibSample camSample = samples[i + bestLag];
+                if (ctrlSample.HasRight && camSample.HasRight)
+                {
+                    Vector3 predShoulder = ctrlSample.HeadPos + ctrlSample.HeadYawRot * shoulderOffsetFromHead;
+                    Vector3 predWrist = predShoulder + qCam * ((baseRot * camSample.RightCamRelWrist) * solvedScale);
+                    residualSum += Vector3.Distance(predWrist, ctrlSample.RightCtrlWorldPos);
+                    residualWeight += 1f;
+                }
+                if (ctrlSample.HasLeft && camSample.HasLeft)
+                {
+                    Vector3 leftOff = hasIndependentLeftShoulder
+                        ? leftShoulderIndependentOffset
+                        : new Vector3(-shoulderOffsetFromHead.x, shoulderOffsetFromHead.y, shoulderOffsetFromHead.z);
+                    Vector3 predShoulder = ctrlSample.HeadPos + ctrlSample.HeadYawRot * leftOff;
+                    Vector3 predWrist = predShoulder + qCam * ((baseRot * camSample.LeftCamRelWrist) * solvedScale);
+                    residualSum += Vector3.Distance(predWrist, ctrlSample.LeftCtrlWorldPos);
+                    residualWeight += 1f;
+                }
+            }
+
+            float meanErrCm = (residualWeight > 0f) ? (residualSum / residualWeight) * 100f : 0f;
+
+            // 6. Refine 6-DOF IMU Wrist Orientation Offset using final resting controller orientation & lock handle origin
+            TrajectoryCalibSample finalSample = samples[n - 1];
+            if (finalSample.HasRight && _rightArmRig != null && _rightArmRig.HandBone != null)
+            {
+                Quaternion desiredHandWorldRot = finalSample.RightCtrlWorldRot * Quaternion.Euler(90f, 0f, 0f);
+                Quaternion baseHandRot = _rightArmRig.HandBone.rotation * Quaternion.Inverse(_rightArmRig.CalibratedHandRotOffset);
+                Quaternion localDelta = Quaternion.Inverse(baseHandRot) * desiredHandWorldRot;
+                _rightArmRig.CalibratedHandRotOffset = Quaternion.RotateTowards(Quaternion.identity, localDelta, 30f);
+
+                if (experimentPreset == ExperimentPreset.StrengthMachineTask)
+                {
+                    EnsureHandleMarker();
+                    machineHandleOrigin.position = finalSample.RightCtrlWorldPos;
+                    machineHandleOrigin.gameObject.SetActive(true);
+                }
+            }
+            if (finalSample.HasLeft && _leftArmRig != null && _leftArmRig.HandBone != null)
+            {
+                Quaternion desiredHandWorldRot = finalSample.LeftCtrlWorldRot * Quaternion.Euler(90f, 0f, 0f);
+                Quaternion baseHandRot = _leftArmRig.HandBone.rotation * Quaternion.Inverse(_leftArmRig.CalibratedHandRotOffset);
+                Quaternion localDelta = Quaternion.Inverse(baseHandRot) * desiredHandWorldRot;
+                _leftArmRig.CalibratedHandRotOffset = Quaternion.RotateTowards(Quaternion.identity, localDelta, 30f);
+            }
+
+            // Lock high-precision 3D path fit so background auto-align doesn't drift over it
+            receiver.continuousAutoCalibration = false;
+            ResetArmElbowPoles();
+            SavePersistentSettings();
+
+            _calibrationFlashTimer = 4.0f;
+            CalibrationStatusMessage = $"3D Path Calibrated! Err={meanErrCm:F1}cm | Lag={bestLag}f | Scale={solvedScale:F2}x | YPR=({solvedYaw:F0},{solvedPitch:F0},{solvedRoll:F0})";
+            Debug.Log($"[ArmAvatarController] {CalibrationStatusMessage}");
+        }
+
+        private static float NormalizeSignedAngle(float deg)
+        {
+            deg %= 360f;
+            if (deg > 180f) deg -= 360f;
+            if (deg < -180f) deg += 360f;
+            return deg;
         }
 
         private void OnDisable()
@@ -1179,15 +1536,20 @@ namespace PsychophysicsVR.Tracking
                 ? (receiver.autoCalibrationLocked ? "<color=#66EEFF><b>AUTO-LOCKED</b></color>" : "<color=#FFEE66><b>AUTO-ALIGNING</b></color>")
                 : "<color=#CCCCCC><b>MANUAL</b></color>";
 
-            GUILayout.Label($"<b>Pimax + D455C v6.1 (Kalman + CDSO PD)</b> | {fingerBadge} | {autoBadge}", labelStyle);
+            GUILayout.Label($"<b>Pimax + D455C v6.2 (3D Path Procrustes + CDSO PD)</b> | {fingerBadge} | {autoBadge}", labelStyle);
             GUILayout.Label($"Status: <b>{CalibrationStatusMessage}</b>", labelStyle);
-            GUILayout.Label("<color=#AADDFF>VR Menu [Tab / A / X]: 3s Gaze Hold Clicks | Ctrl: [B/Y]=Mesh [Grip]=Arm [Grip+Trig]=6-DOF Calib</color>", labelStyle);
+            GUILayout.Label("<color=#AADDFF>VR Menu [Tab / A / X]: 3s Gaze Hold Clicks | Ctrl: [B/Y]=Mesh [Grip]=Arm [Grip+Trig]=Match</color>", labelStyle);
 
             GUILayout.BeginHorizontal();
             GUI.backgroundColor = _calibrationFlashTimer > 0f ? Color.green : new Color(0.15f, 0.85f, 1f);
-            if (GUILayout.Button("Calibrate Now (C)", btnStyle, GUILayout.Height(34)))
+            if (GUILayout.Button("Calibrate Cam (C)", btnStyle, GUILayout.Height(34)))
             {
                 PerformOneClickCalibration();
+            }
+            GUI.backgroundColor = new Color(0.25f, 0.95f, 0.55f);
+            if (GUILayout.Button("Guided 8s Path Calib", btnStyle, GUILayout.Height(34)))
+            {
+                GetComponent<VRDashboardAndController>()?.StartGuidedPathCalibrationPrompt();
             }
             GUI.backgroundColor = receiver.continuousAutoCalibration ? new Color(0.4f, 0.9f, 0.7f) : new Color(0.7f, 0.7f, 0.7f);
             if (GUILayout.Button($"Auto-Align: {(receiver.continuousAutoCalibration ? "ON" : "OFF")}", btnStyle, GUILayout.Height(34)))

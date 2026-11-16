@@ -32,6 +32,14 @@ namespace PsychophysicsVR.Tracking
         [Range(-180f, 180f)]
         public float cameraYawOffsetDeg = 0f;
 
+        [Tooltip("Vertical tilt angle (degrees) of the physical D455C camera (solved automatically by Guided 3D Path Calibration).")]
+        [Range(-45f, 45f)]
+        public float cameraPitchOffsetDeg = 0f;
+
+        [Tooltip("Roll tilt angle (degrees) of the physical D455C camera (solved automatically by Guided 3D Path Calibration).")]
+        [Range(-45f, 45f)]
+        public float cameraRollOffsetDeg = 0f;
+
         [Tooltip("Scale multiplier to match the participant's real arm length to the Unity avatar's arm length.")]
         public float armScale = 1.0f;
 
@@ -340,7 +348,7 @@ namespace PsychophysicsVR.Tracking
 
             // --- 4. Project Continuous Predicted Arm Positions Into Unity World Space Every Frame ---
             Quaternion baseRot = cameraOrientationReference != null ? cameraOrientationReference.rotation : Quaternion.identity;
-            Quaternion yawRot = Quaternion.Euler(0f, cameraYawOffsetDeg, 0f) * baseRot;
+            Quaternion yawRot = Quaternion.Euler(cameraPitchOffsetDeg, cameraYawOffsetDeg, cameraRollOffsetDeg) * baseRot;
 
             Vector3 worldRightShoulder = avatarShoulderAnchor != null ? avatarShoulderAnchor.position : transform.position;
             Vector3 worldLeftShoulder = leftAvatarShoulderAnchor != null ? leftAvatarShoulderAnchor.position : worldRightShoulder + new Vector3(-0.34f, 0f, 0f);

@@ -1,6 +1,6 @@
-# Pimax Crystal + Intel RealSense D455C VR Arm & 21-Finger Illusion System (v6.0)
+# Pimax Crystal + Intel RealSense D455C VR Arm & 21-Finger Illusion System (v6.2)
 
-Real-time, jitter-free 3D upper-limb and 21-DOF finger embodiment in **Unity VR** using the **Pimax Crystal HMD**, **Intel RealSense D455C Stereo Depth Camera**, and **Google MediaPipe**. Engineered for general seated psychophysics experiments (free reaching, strength-machine force illusions, and proprioceptive drift) with continuous 90/120 Hz Kalman prediction, Critically Damped Second-Order (CDSO) PD joint control, background torso auto-alignment, and an in-headset 3D VR controller dashboard.
+Real-time, jitter-free 3D upper-limb and 21-DOF finger embodiment in **Unity VR** using the **Pimax Crystal HMD**, **Intel RealSense D455C Stereo Depth Camera**, and **Google MediaPipe**. Engineered for general seated psychophysics experiments (free reaching, strength-machine force illusions, and proprioceptive drift) with continuous 90/120 Hz Kalman prediction, Critically Damped Second-Order (CDSO) PD joint control, background torso auto-alignment, **8.5s Guided 6-DOF 3D Path Calibration**, and an in-headset 3D VR controller/gaze-dwell dashboard.
 
 ---
 
@@ -98,12 +98,16 @@ Once your new Unity project opens:
 
 | Input (VR Controller / Keyboard) | Function |
 | :--- | :--- |
+| **`GUIDED 8s 3D PATH CALIBRATION`** (VR/HUD Button) | Spawns glowing 3D guide orb(s) for Right, Left, or Both arms. Hold controller(s), press **`A`/`X`/`Space`** (or hold inside the orb for `1.8s`), and follow the 5-stage 3D star + arc sweep. Automatically solves **temporal pipeline lag**, **3D Camera Yaw/Pitch/Roll**, **isotropic arm scale**, **independent Left/Right shoulder sockets**, and **6-DOF IMU wrist offset**! |
+| **3-Second Gaze Hold** (Inside VR) | Hands-free menu click: hold your head-gaze cursor on any button on the floating 3D VR Dashboard for **3 seconds** to auto-click! |
 | **`A` / `X` Button** or **`Tab`** | **Show / Hide & Recenter 3D VR Dashboard** directly inside your Pimax headset! |
 | **Point + `Trigger`** | **Click any button** on the floating 3D VR Dashboard inside the headset. |
-| **`Grip + Trigger`** | **Match VR Controller Position:** Uses the Pimax controller's exact 3D coordinate as a golden reference to align camera yaw, arm scale, and shoulder offset simultaneously. |
+| **`Grip + Trigger`** | **Quick Match VR Controller:** Single-point snapshot using the Pimax controller's exact 3D coordinate + IMU rotation. |
 | **`B` / `Y` Button** or **`M`** | **Cycle 3D Hand/Arm Model:** Switches live between **`MicrosoftContinuousMesh`**, **`HumanSkinContinuousMesh`**, and **`BubbleJoints`**. |
 | **`Grip` Button** or **`R`** | **Cycle Active Arms:** Switches live between **`RightArmOnly`** ➔ **`LeftArmOnly`** ➔ **`BothArms`** (synced automatically between Python and Unity). |
 | **Controller `Thumbstick`** | **Live Adjustments:** Up/Down adjusts Shoulder Height (`Y`); Left/Right adjusts Force/Movement Gain (hold `Grip` + Left/Right to rotate Camera Yaw). |
 | **`C`** or **`Space`** (Keyboard) | **Manual Calibration Snapshot:** Forces immediate camera yaw + scale snapshot and saves to persistent memory (`PlayerPrefs`). *(Note: Continuous Background Auto-Alignment is ON by default so manual calibration is optional!)* |
 | **`V`** / **`Q`** (Python Window) | **`V`**: Toggle OpenCV video overlay drawing (saves ~2 ms/frame). **`Q`**: Quit tracker cleanly. |
+
+> **OpenXR Controller Note:** To see Pimax Crystal controllers inside Unity, open **`Edit` -> `Project Settings` -> `XR Plug-in Management` -> `OpenXR` -> `Interaction Profiles`**, click **`+`**, and add **`Oculus Touch Controller Profile`**.
 

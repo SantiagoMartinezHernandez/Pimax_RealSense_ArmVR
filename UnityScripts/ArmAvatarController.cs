@@ -148,6 +148,7 @@ namespace PsychophysicsVR.Tracking
 
             public Vector3 SmoothedElbowPerpDir;
             public Vector3 DraggedWristPos;
+            public Quaternion CalibratedHandRotOffset = Quaternion.identity;
             public bool PoseInitialized;
             public bool DragInitialized;
 
@@ -505,11 +506,23 @@ namespace PsychophysicsVR.Tracking
                 machineHandleOrigin.gameObject.SetActive(true);
             }
 
+            // 4. Use 6-DOF IMU orientation (`controllerWorldRot`) to refine wrist roll/pitch alignment
+            ProceduralArmRig targetRig = isLeftController ? _leftArmRig : _rightArmRig;
+            if (targetRig != null && targetRig.HandBone != null)
+            {
+                // Controller's local +Z forward points along fingers; align HandBone's up-axis (+Y) toward controller +Z
+                Quaternion desiredHandWorldRot = controllerWorldRot * Quaternion.Euler(90f, 0f, 0f);
+                Quaternion baseHandRot = targetRig.HandBone.rotation * Quaternion.Inverse(targetRig.CalibratedHandRotOffset);
+                Quaternion localDelta = Quaternion.Inverse(baseHandRot) * desiredHandWorldRot;
+                // Clamp rotational correction to +-30 degrees for anatomical safety
+                targetRig.CalibratedHandRotOffset = Quaternion.RotateTowards(Quaternion.identity, localDelta, 30f);
+            }
+
             ResetArmElbowPoles();
             SavePersistentSettings();
 
             _calibrationFlashTimer = 3.0f;
-            CalibrationStatusMessage = $"Matched VR Controller! Yaw={receiver.cameraYawOffsetDeg:F0} deg, ShY={shoulderOffsetFromHead.y:F2}m";
+            CalibrationStatusMessage = $"Matched 6-DOF Controller! Yaw={receiver.cameraYawOffsetDeg:F0} deg, ShY={shoulderOffsetFromHead.y:F2}m";
             Debug.Log($"[ArmAvatarController] {CalibrationStatusMessage}");
         }
 
@@ -628,6 +641,8 @@ namespace PsychophysicsVR.Tracking
                 receiver.continuousAutoCalibration = true;
                 receiver.ResetAutoCalibrationLock();
             }
+            if (_rightArmRig != null) _rightArmRig.CalibratedHandRotOffset = Quaternion.identity;
+            if (_leftArmRig != null) _leftArmRig.CalibratedHandRotOffset = Quaternion.identity;
             CalibrationStatusMessage = "Reset settings to factory defaults.";
         }
 
@@ -905,7 +920,7 @@ namespace PsychophysicsVR.Tracking
             Vector3 smoothedPalmNorm = rig.PalmNormSpring.Step(rawPalmNorm.normalized, dt, pdNaturalFrequencyHz * 1.4f).normalized;
             if (smoothedPalmNorm.sqrMagnitude < 0.001f) smoothedPalmNorm = bendPlaneNormal;
 
-            Quaternion targetHandRot = AlignBoneAxes(smoothedHandFwd, smoothedPalmNorm);
+            Quaternion targetHandRot = AlignBoneAxes(smoothedHandFwd, smoothedPalmNorm) * rig.CalibratedHandRotOffset;
 
             // --- 6. Drive Bone Rotations via Critically Damped Quaternion PD Controllers ---
             float rotFreq = pdNaturalFrequencyHz * 1.35f;
@@ -1164,9 +1179,9 @@ namespace PsychophysicsVR.Tracking
                 ? (receiver.autoCalibrationLocked ? "<color=#66EEFF><b>AUTO-LOCKED</b></color>" : "<color=#FFEE66><b>AUTO-ALIGNING</b></color>")
                 : "<color=#CCCCCC><b>MANUAL</b></color>";
 
-            GUILayout.Label($"<b>Pimax + D455C v6.0 (Kalman + CDSO PD)</b> | {fingerBadge} | {autoBadge}", labelStyle);
+            GUILayout.Label($"<b>Pimax + D455C v6.1 (Kalman + CDSO PD)</b> | {fingerBadge} | {autoBadge}", labelStyle);
             GUILayout.Label($"Status: <b>{CalibrationStatusMessage}</b>", labelStyle);
-            GUILayout.Label("<color=#AADDFF>VR Controls: [A/X]=VR Menu | [B/Y]=Mesh | [Grip]=Arm | [Grip+Trigger]=Match Controller</color>", labelStyle);
+            GUILayout.Label("<color=#AADDFF>VR Menu [Tab / A / X]: 3s Gaze Hold Clicks | Ctrl: [B/Y]=Mesh [Grip]=Arm [Grip+Trig]=6-DOF Calib</color>", labelStyle);
 
             GUILayout.BeginHorizontal();
             GUI.backgroundColor = _calibrationFlashTimer > 0f ? Color.green : new Color(0.15f, 0.85f, 1f);

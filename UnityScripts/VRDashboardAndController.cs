@@ -11,13 +11,15 @@ using UnityEngine.InputSystem.XR;
 namespace PsychophysicsVR.Tracking
 {
     /// <summary>
-    /// v6.2 In-Headset 3D World-Space VR Dashboard + Guided 6-DOF 3D Path Calibration Arena:
-    ///   1. Guided 8.5s 3D Path Calibration: spawns glowing 3D target orb(s) for Right, Left, or Both arms,
-    ///      waits for [A/X]/[Space] (or holding inside orb), guides the user through a 5-stage 3D star +
-    ///      figure-8 sweep, and runs lag-compensated Procrustes 3D alignment (Yaw/Pitch/Roll, Scale,
-    ///      independent Left/Right shoulder sockets, and 6-DOF IMU wrist offset).
-    ///   2. Hands-Free 3-Second Gaze-Dwell Auto-Click + Controller Trigger / Mouse / Enter instant click.
-    ///   3. Dual-API Pimax OpenXR Controller Tracking (UnityEngine.XR.InputDevices + InputSystem XRController).
+    /// v6.3 In-Headset 3D World-Space VR Dashboard + Continuous Multi-Backend Pimax Controller Tracking
+    /// + Guided 6-DOF 3D Path Calibration Arena:
+    ///   - Explicitly creates and enables OpenXR InputActions (&lt;XRController&gt;{RightHand}/{LeftHand})
+    ///     alongside XR.InputDevices &amp; InputSystem XRController polling so 6-DOF controller poses
+    ///     never freeze or drop out mid-path.
+    ///   - Keeps 3D controller/hand wands and target-tether lines continuously visible &amp; updating
+    ///     throughout the entire 8.5s guided trajectory (falling back to Camera Hand + Target Orb
+    ///     reference if physical controller poses aren't moving).
+    ///   - Hands-Free 3-Second Gaze-Dwell Auto-Click + Trigger / Mouse / Enter instant click.
     /// </summary>
     public class VRDashboardAndController : MonoBehaviour
     {
@@ -60,12 +62,108 @@ namespace PsychophysicsVR.Tracking
         private TextMesh _guidedBannerText;
         private LineRenderer _rightPathPreviewLine;
         private LineRenderer _leftPathPreviewLine;
+        private LineRenderer _rightTetherLine;
+        private LineRenderer _leftTetherLine;
         private Vector3 _guidedArenaOriginPos;
         private Quaternion _guidedArenaHeadYaw = Quaternion.identity;
         private float _guidedTimer;
         private float _orbHoldStartTimer;
         private readonly List<TrajectoryCalibSample> _recordedSamples = new List<TrajectoryCalibSample>(1024);
+        private readonly List<Vector3> _recordedRightOrbPositions = new List<Vector3>(1024);
+        private readonly List<Vector3> _recordedLeftOrbPositions = new List<Vector3>(1024);
+        private float _rightCtrlTravelDuringPath;
+        private float _leftCtrlTravelDuringPath;
+        private Vector3 _prevSampleRightCtrlPos;
+        private Vector3 _prevSampleLeftCtrlPos;
+        private bool _hasPrevSampleRightCtrl;
+        private bool _hasPrevSampleLeftCtrl;
         private const float GuidedPathDuration = 8.5f;
+
+        // Cached controller states so markers never flicker/disappear on a dropped frame
+        private bool _hasCachedRight;
+        private Vector3 _cachedRightPos;
+        private Quaternion _cachedRightRot = Quaternion.identity;
+        private bool _hasCachedLeft;
+        private Vector3 _cachedLeftPos;
+        private Quaternion _cachedLeftRot = Quaternion.identity;
+        private readonly List<UnityEngine.XR.InputDevice> _xrDeviceCache = new List<UnityEngine.XR.InputDevice>(8);
+
+#if ENABLE_INPUT_SYSTEM
+        private class HandInputActions
+        {
+            public InputAction PosAction;
+            public InputAction RotAction;
+            public InputAction TriggerAction;
+            public InputAction GripAction;
+            public InputAction PrimaryAction;
+            public InputAction SecondaryAction;
+            public InputAction StickAction;
+
+            public HandInputActions(string handTag)
+            {
+                PosAction = new InputAction($"{handTag}_Pos", InputActionType.Value, expectedControlType: "Vector3");
+                PosAction.AddBinding($"<XRController>{{{handTag}}}/devicePosition");
+                PosAction.AddBinding($"<XRController>{{{handTag}}}/pointerPosition");
+                PosAction.AddBinding($"<XRController>{{{handTag}}}/gripPosition");
+
+                RotAction = new InputAction($"{handTag}_Rot", InputActionType.Value, expectedControlType: "Quaternion");
+                RotAction.AddBinding($"<XRController>{{{handTag}}}/deviceRotation");
+                RotAction.AddBinding($"<XRController>{{{handTag}}}/pointerRotation");
+                RotAction.AddBinding($"<XRController>{{{handTag}}}/gripRotation");
+
+                TriggerAction = new InputAction($"{handTag}_Trig", InputActionType.Button);
+                TriggerAction.AddBinding($"<XRController>{{{handTag}}}/triggerPressed");
+
+                GripAction = new InputAction($"{handTag}_Grip", InputActionType.Button);
+                GripAction.AddBinding($"<XRController>{{{handTag}}}/gripPressed");
+
+                PrimaryAction = new InputAction($"{handTag}_Prim", InputActionType.Button);
+                PrimaryAction.AddBinding($"<XRController>{{{handTag}}}/primaryButton");
+
+                SecondaryAction = new InputAction($"{handTag}_Sec", InputActionType.Button);
+                SecondaryAction.AddBinding($"<XRController>{{{handTag}}}/secondaryButton");
+
+                StickAction = new InputAction($"{handTag}_Stick", InputActionType.Value, expectedControlType: "Vector2");
+                StickAction.AddBinding($"<XRController>{{{handTag}}}/thumbstick");
+            }
+
+            public void Enable()
+            {
+                PosAction.Enable();
+                RotAction.Enable();
+                TriggerAction.Enable();
+                GripAction.Enable();
+                PrimaryAction.Enable();
+                SecondaryAction.Enable();
+                StickAction.Enable();
+            }
+
+            public void Disable()
+            {
+                PosAction.Disable();
+                RotAction.Disable();
+                TriggerAction.Disable();
+                GripAction.Disable();
+                PrimaryAction.Disable();
+                SecondaryAction.Disable();
+                StickAction.Disable();
+            }
+
+            public void Dispose()
+            {
+                PosAction.Dispose();
+                RotAction.Dispose();
+                TriggerAction.Dispose();
+                GripAction.Dispose();
+                PrimaryAction.Dispose();
+                SecondaryAction.Dispose();
+                StickAction.Dispose();
+            }
+        }
+
+        private HandInputActions _rightActions;
+        private HandInputActions _leftActions;
+#endif
 
         private class VRButtonItem
         {
@@ -101,6 +199,32 @@ namespace PsychophysicsVR.Tracking
             public bool Grip;
             public bool Trigger;
             public Vector2 Stick;
+        }
+
+        private void OnEnable()
+        {
+#if ENABLE_INPUT_SYSTEM
+            if (_rightActions == null) _rightActions = new HandInputActions("RightHand");
+            if (_leftActions == null) _leftActions = new HandInputActions("LeftHand");
+            _rightActions.Enable();
+            _leftActions.Enable();
+#endif
+        }
+
+        private void OnDisable()
+        {
+#if ENABLE_INPUT_SYSTEM
+            _rightActions?.Disable();
+            _leftActions?.Disable();
+#endif
+        }
+
+        private void OnDestroy()
+        {
+#if ENABLE_INPUT_SYSTEM
+            _rightActions?.Dispose();
+            _leftActions?.Dispose();
+#endif
         }
 
         private void Start()
@@ -175,12 +299,16 @@ namespace PsychophysicsVR.Tracking
             _guidedTimer = 0f;
             _orbHoldStartTimer = 0f;
             _recordedSamples.Clear();
+            _recordedRightOrbPositions.Clear();
+            _recordedLeftOrbPositions.Clear();
+            _rightCtrlTravelDuringPath = 0f;
+            _leftCtrlTravelDuringPath = 0f;
+            _hasPrevSampleRightCtrl = false;
+            _hasPrevSampleLeftCtrl = false;
 
-            // Lock arena frame to user's current seated head position & horizontal yaw
             _guidedArenaOriginPos = _vrCam.transform.position;
             _guidedArenaHeadYaw = Quaternion.Euler(0f, _vrCam.transform.eulerAngles.y, 0f);
 
-            // Hide menu board so user has a clean workspace for the 3D orbs
             if (_boardRoot != null) _boardRoot.SetActive(false);
             if (_laserLine != null) _laserLine.enabled = false;
             if (_cursorDot != null) _cursorDot.gameObject.SetActive(false);
@@ -193,7 +321,11 @@ namespace PsychophysicsVR.Tracking
         {
             _guidedState = GuidedCalibState.Idle;
             _recordedSamples.Clear();
+            _recordedRightOrbPositions.Clear();
+            _recordedLeftOrbPositions.Clear();
             if (_guidedArenaRoot != null) _guidedArenaRoot.SetActive(false);
+            if (_rightTetherLine != null) _rightTetherLine.enabled = false;
+            if (_leftTetherLine != null) _leftTetherLine.enabled = false;
             showVRDashboard = true;
             if (_boardRoot != null)
             {
@@ -228,11 +360,21 @@ namespace PsychophysicsVR.Tracking
             ControllerState right = ReadControllerState(isLeft: false);
             ControllerState left = ReadControllerState(isLeft: true);
 
-            _anyControllerTracked = right.Tracked || left.Tracked;
+            // Cache last known valid poses so markers never vanish on a dropped OpenXR frame
+            if (right.Tracked)
+            {
+                _hasCachedRight = true;
+                _cachedRightPos = right.WorldPos;
+                _cachedRightRot = right.WorldRot;
+            }
+            if (left.Tracked)
+            {
+                _hasCachedLeft = true;
+                _cachedLeftPos = left.WorldPos;
+                _cachedLeftRot = left.WorldRot;
+            }
 
-            bool showMarkers = (_guidedState != GuidedCalibState.Idle) || right.Tracked || left.Tracked;
-            UpdateControllerMarker(_rightCtrlMarker, right.Tracked && showMarkers, right.WorldPos, right.WorldRot);
-            UpdateControllerMarker(_leftCtrlMarker, left.Tracked && showMarkers, left.WorldPos, left.WorldRot);
+            _anyControllerTracked = right.Tracked || left.Tracked || _hasCachedRight || _hasCachedLeft;
 
             bool primJustPressed = (right.Primary && !_prevRPrimary) || (left.Primary && !_prevLPrimary);
             bool secJustPressed = (right.Secondary && !_prevRSecondary) || (left.Secondary && !_prevLSecondary);
@@ -259,7 +401,14 @@ namespace PsychophysicsVR.Tracking
                 return;
             }
 
-            // --- Standard VR Dashboard & Controller Shortcuts ---
+            // Update normal-mode controller wands (remain visible whenever tracked/cached)
+            UpdateControllerMarker(_rightCtrlMarker, right.Tracked || _hasCachedRight,
+                right.Tracked ? right.WorldPos : _cachedRightPos,
+                right.Tracked ? right.WorldRot : _cachedRightRot);
+            UpdateControllerMarker(_leftCtrlMarker, left.Tracked || _hasCachedLeft,
+                left.Tracked ? left.WorldPos : _cachedLeftPos,
+                left.Tracked ? left.WorldRot : _cachedLeftRot);
+
             if (primJustPressed)
             {
                 ToggleVRDashboard();
@@ -270,13 +419,13 @@ namespace PsychophysicsVR.Tracking
                 controller?.CycleVisualStyle();
             }
 
-            if (right.Grip && rTrigJustPressed && right.Tracked && controller != null)
+            if (right.Grip && rTrigJustPressed && (right.Tracked || _hasCachedRight) && controller != null)
             {
-                controller.CalibrateToVRController(right.WorldPos, right.WorldRot, isLeftController: false);
+                controller.CalibrateToVRController(right.Tracked ? right.WorldPos : _cachedRightPos, right.Tracked ? right.WorldRot : _cachedRightRot, isLeftController: false);
             }
-            else if (left.Grip && lTrigJustPressed && left.Tracked && controller != null)
+            else if (left.Grip && lTrigJustPressed && (left.Tracked || _hasCachedLeft) && controller != null)
             {
-                controller.CalibrateToVRController(left.WorldPos, left.WorldRot, isLeftController: true);
+                controller.CalibrateToVRController(left.Tracked ? left.WorldPos : _cachedLeftPos, left.Tracked ? left.WorldRot : _cachedLeftRot, isLeftController: true);
             }
             else if ((right.Grip && !_prevRGrip && !right.Trigger) || (left.Grip && !_prevLGrip && !left.Trigger))
             {
@@ -308,9 +457,11 @@ namespace PsychophysicsVR.Tracking
             }
 
             bool manualClick = WasManualClickPressedThisFrame();
+            bool rUse = right.Tracked || _hasCachedRight;
+            bool lUse = left.Tracked || _hasCachedLeft;
             UpdateLaserPointerAndClicks(
-                right.Tracked, right.WorldPos, right.WorldRot, rTrigJustPressed && !right.Grip,
-                left.Tracked, left.WorldPos, left.WorldRot, lTrigJustPressed && !left.Grip,
+                rUse, right.Tracked ? right.WorldPos : _cachedRightPos, right.Tracked ? right.WorldRot : _cachedRightRot, rTrigJustPressed && !right.Grip,
+                lUse, left.Tracked ? left.WorldPos : _cachedLeftPos, left.Tracked ? left.WorldRot : _cachedLeftRot, lTrigJustPressed && !left.Grip,
                 manualClick
             );
 
@@ -343,10 +494,24 @@ namespace PsychophysicsVR.Tracking
             _rightPathPreviewLine.enabled = needRight;
             _leftPathPreviewLine.enabled = needLeft;
 
-            // Position banner cleanly above the workspace
+            // Resolve live marker pose for Right & Left:
+            // Prefer live 6-DOF Controller pose -> Cached Controller pose -> Live Camera-Tracked Wrist pose!
+            bool rHasCtrl = right.Tracked || _hasCachedRight;
+            bool lHasCtrl = left.Tracked || _hasCachedLeft;
+
+            Vector3 rMarkerPos = right.Tracked ? right.WorldPos : (_hasCachedRight ? _cachedRightPos : (receiver != null && receiver.HasValidTracking ? receiver.WristPos : _guidedArenaOriginPos + _guidedArenaHeadYaw * EvaluateGuidedLocalWaypoint(0f, true)));
+            Quaternion rMarkerRot = right.Tracked ? right.WorldRot : (_hasCachedRight ? _cachedRightRot : Quaternion.identity);
+
+            Vector3 lMarkerPos = left.Tracked ? left.WorldPos : (_hasCachedLeft ? _cachedLeftPos : (receiver != null && receiver.HasValidTracking ? receiver.LeftWristPos : _guidedArenaOriginPos + _guidedArenaHeadYaw * EvaluateGuidedLocalWaypoint(0f, false)));
+            Quaternion lMarkerRot = left.Tracked ? left.WorldRot : (_hasCachedLeft ? _cachedLeftRot : Quaternion.identity);
+
+            // Always keep controller/hand markers visible and updating every frame during the path!
+            UpdateControllerMarker(_rightCtrlMarker, needRight, rMarkerPos, rMarkerRot);
+            UpdateControllerMarker(_leftCtrlMarker, needLeft, lMarkerPos, lMarkerRot);
+
             if (_guidedBannerText != null)
             {
-                _guidedBannerText.transform.position = _guidedArenaOriginPos + _guidedArenaHeadYaw * new Vector3(0f, 0.22f, 0.65f);
+                _guidedBannerText.transform.position = _guidedArenaOriginPos + _guidedArenaHeadYaw * new Vector3(0f, 0.23f, 0.65f);
                 _guidedBannerText.transform.rotation = _guidedArenaHeadYaw;
             }
 
@@ -357,13 +522,16 @@ namespace PsychophysicsVR.Tracking
                 _rightTargetOrb.position = rStartWorld;
                 _leftTargetOrb.position = lStartWorld;
 
-                bool rInside = !needRight || (right.Tracked && Vector3.Distance(right.WorldPos, rStartWorld) < 0.12f);
-                bool lInside = !needLeft || (left.Tracked && Vector3.Distance(left.WorldPos, lStartWorld) < 0.12f);
+                bool rInside = !needRight || Vector3.Distance(rMarkerPos, rStartWorld) < 0.13f;
+                bool lInside = !needLeft || Vector3.Distance(lMarkerPos, lStartWorld) < 0.13f;
 
                 SetMaterialColor(_rightTargetOrb.gameObject, rInside ? Color.green : Color.cyan);
                 SetMaterialColor(_leftTargetOrb.gameObject, lInside ? Color.green : new Color(1f, 0.72f, 0.15f));
 
-                if (rInside && lInside && ((needRight && right.Tracked) || (needLeft && left.Tracked)))
+                UpdateTetherLine(_rightTetherLine, needRight, rMarkerPos, rStartWorld, rInside);
+                UpdateTetherLine(_leftTetherLine, needLeft, lMarkerPos, lStartWorld, lInside);
+
+                if (rInside && lInside && ((needRight && (rHasCtrl || (receiver != null && receiver.HasValidTracking))) || (needLeft && (lHasCtrl || (receiver != null && receiver.HasValidTracking)))))
                 {
                     _orbHoldStartTimer += Time.unscaledDeltaTime;
                 }
@@ -373,29 +541,30 @@ namespace PsychophysicsVR.Tracking
                 }
 
                 string armPrompt = mode == ActiveArmMode.BothArms
-                    ? "BOTH Controllers"
-                    : (mode == ActiveArmMode.LeftArmOnly ? "LEFT Controller" : "RIGHT Controller");
+                    ? "BOTH Controllers / Hands"
+                    : (mode == ActiveArmMode.LeftArmOnly ? "LEFT Controller / Hand" : "RIGHT Controller / Hand");
 
                 string holdHint = _orbHoldStartTimer > 0.1f
                     ? $"Hold steady... starting in {Mathf.Max(0f, 1.8f - _orbHoldStartTimer):F1}s"
                     : "Press [A / X], [Trigger], or [Space] to begin! ([B/Y] or [Tab] to cancel)";
 
-                string ctrlWarn = (!_anyControllerTracked)
-                    ? "\n(No Pimax Controller detected — add 'Oculus Touch Profile' in OpenXR Settings)"
-                    : "";
+                string sourceBadge = (rHasCtrl || lHasCtrl)
+                    ? "6-DOF Controller Active"
+                    : "Camera-Hand Mode (No VR Ctrl detected — Target Orb will serve as 3D Reference)";
 
-                _guidedBannerText.text = $"GUIDED 6-DOF 3D PATH CALIBRATION\nFirmly grab {armPrompt} and place inside Orb\n{holdHint}{ctrlWarn}";
+                _guidedBannerText.text = $"GUIDED 3D PATH CALIBRATION ({sourceBadge})\nHold {armPrompt} inside Orb\n{holdHint}";
 
                 if (startPressed || _orbHoldStartTimer >= 1.8f)
                 {
-                    if (!_anyControllerTracked)
-                    {
-                        _guidedBannerText.text = "Cannot run 6-DOF Path: No VR Controller tracked!\nCheck OpenXR Interaction Profiles.";
-                        return;
-                    }
                     _guidedState = GuidedCalibState.RunningPath;
                     _guidedTimer = 0f;
                     _recordedSamples.Clear();
+                    _recordedRightOrbPositions.Clear();
+                    _recordedLeftOrbPositions.Clear();
+                    _rightCtrlTravelDuringPath = 0f;
+                    _leftCtrlTravelDuringPath = 0f;
+                    _hasPrevSampleRightCtrl = false;
+                    _hasPrevSampleLeftCtrl = false;
                 }
                 return;
             }
@@ -411,42 +580,82 @@ namespace PsychophysicsVR.Tracking
                 _rightTargetOrb.position = rTargetWorld;
                 _leftTargetOrb.position = lTargetWorld;
 
-                bool rOnTarget = !needRight || (right.Tracked && Vector3.Distance(right.WorldPos, rTargetWorld) < 0.14f);
-                bool lOnTarget = !needLeft || (left.Tracked && Vector3.Distance(left.WorldPos, lTargetWorld) < 0.14f);
+                bool rOnTarget = !needRight || Vector3.Distance(rMarkerPos, rTargetWorld) < 0.15f;
+                bool lOnTarget = !needLeft || Vector3.Distance(lMarkerPos, lTargetWorld) < 0.15f;
 
                 SetMaterialColor(_rightTargetOrb.gameObject, rOnTarget ? Color.green : Color.cyan);
                 SetMaterialColor(_leftTargetOrb.gameObject, lOnTarget ? Color.green : new Color(1f, 0.72f, 0.15f));
 
+                UpdateTetherLine(_rightTetherLine, needRight, rMarkerPos, rTargetWorld, rOnTarget);
+                UpdateTetherLine(_leftTetherLine, needLeft, lMarkerPos, lTargetWorld, lOnTarget);
+
+                if (needRight && rHasCtrl)
+                {
+                    if (_hasPrevSampleRightCtrl)
+                        _rightCtrlTravelDuringPath += Vector3.Distance(rMarkerPos, _prevSampleRightCtrlPos);
+                    _prevSampleRightCtrlPos = rMarkerPos;
+                    _hasPrevSampleRightCtrl = true;
+                }
+                if (needLeft && lHasCtrl)
+                {
+                    if (_hasPrevSampleLeftCtrl)
+                        _leftCtrlTravelDuringPath += Vector3.Distance(lMarkerPos, _prevSampleLeftCtrlPos);
+                    _prevSampleLeftCtrlPos = lMarkerPos;
+                    _hasPrevSampleLeftCtrl = true;
+                }
+
                 string stageDesc = GetStageLabel(normT);
                 float remain = Mathf.Max(0f, GuidedPathDuration - _guidedTimer);
-                _guidedBannerText.text = $"FOLLOW THE ORB SMOOTHLY  ({remain:F1}s remaining)\n{stageDesc}\nSamples Recorded: {_recordedSamples.Count}";
+                string liveDebug = needRight && rHasCtrl
+                    ? $"CtrlPos: ({rMarkerPos.x:F2}, {rMarkerPos.y:F2}, {rMarkerPos.z:F2})"
+                    : $"OrbRef Mode (Samples: {_recordedSamples.Count})";
 
-                // Record synchronized 6-DOF Controller + Camera sample
+                _guidedBannerText.text = $"FOLLOW THE ORB SMOOTHLY  ({remain:F1}s remaining)\n{stageDesc}\n{liveDebug} | Samples: {_recordedSamples.Count}";
+
                 if (_vrCam != null && receiver != null)
                 {
                     Quaternion curHeadYaw = Quaternion.Euler(0f, _vrCam.transform.eulerAngles.y, 0f);
+                    _recordedRightOrbPositions.Add(rTargetWorld);
+                    _recordedLeftOrbPositions.Add(lTargetWorld);
+
                     _recordedSamples.Add(new TrajectoryCalibSample
                     {
                         Timestamp = Time.unscaledTime,
                         HeadPos = _vrCam.transform.position,
                         HeadYawRot = curHeadYaw,
-                        HasRight = needRight && right.Tracked && receiver.trackingConfidence > 0.30f,
+                        HasRight = needRight && receiver.trackingConfidence > 0.30f,
                         RightCamRelWrist = receiver.LocalShoulderToWrist,
-                        RightCtrlWorldPos = right.WorldPos,
-                        RightCtrlWorldRot = right.WorldRot,
+                        RightCtrlWorldPos = rHasCtrl ? rMarkerPos : rTargetWorld,
+                        RightCtrlWorldRot = rHasCtrl ? rMarkerRot : Quaternion.identity,
                         RightConfidence = receiver.trackingConfidence,
-                        HasLeft = needLeft && left.Tracked && receiver.leftTrackingConfidence > 0.30f,
+                        HasLeft = needLeft && receiver.leftTrackingConfidence > 0.30f,
                         LeftCamRelWrist = receiver.LocalLeftShoulderToWrist,
-                        LeftCtrlWorldPos = left.WorldPos,
-                        LeftCtrlWorldRot = left.WorldRot,
+                        LeftCtrlWorldPos = lHasCtrl ? lMarkerPos : lTargetWorld,
+                        LeftCtrlWorldRot = lHasCtrl ? lMarkerRot : Quaternion.identity,
                         LeftConfidence = receiver.leftTrackingConfidence
                     });
                 }
 
                 if (_guidedTimer >= GuidedPathDuration)
                 {
+                    // If a physical controller existed in the scene at 0,0,0 static without moving (< 8cm total travel),
+                    // substitute the moving Target Orb trajectory so camera-only users still get a clean 3D Procrustes fit!
+                    bool ctrlActuallyMoved = (_rightCtrlTravelDuringPath > 0.08f) || (_leftCtrlTravelDuringPath > 0.08f);
+                    if (!ctrlActuallyMoved && _recordedSamples.Count == _recordedRightOrbPositions.Count)
+                    {
+                        for (int i = 0; i < _recordedSamples.Count; i++)
+                        {
+                            TrajectoryCalibSample s = _recordedSamples[i];
+                            s.RightCtrlWorldPos = _recordedRightOrbPositions[i];
+                            s.LeftCtrlWorldPos = _recordedLeftOrbPositions[i];
+                            _recordedSamples[i] = s;
+                        }
+                    }
+
                     _guidedState = GuidedCalibState.Idle;
                     _guidedArenaRoot.SetActive(false);
+                    if (_rightTetherLine != null) _rightTetherLine.enabled = false;
+                    if (_leftTetherLine != null) _leftTetherLine.enabled = false;
                     showVRDashboard = true;
                     if (_boardRoot != null)
                     {
@@ -458,18 +667,27 @@ namespace PsychophysicsVR.Tracking
             }
         }
 
-        /// <summary>
-        /// Evaluates the 5-Stage 3D Star + Figure-8 Calibration Trajectory in Head-Yaw local meters.
-        /// Uses SmoothStep between corners so velocity naturally pauses at each 3D corner anchor!
-        /// </summary>
+        private static void UpdateTetherLine(LineRenderer lr, bool active, Vector3 fromPos, Vector3 toPos, bool aligned)
+        {
+            if (lr == null) return;
+            lr.enabled = active;
+            if (active)
+            {
+                lr.SetPosition(0, fromPos);
+                lr.SetPosition(1, toPos);
+                if (lr.sharedMaterial != null)
+                    lr.sharedMaterial.color = aligned ? Color.green : Color.yellow;
+            }
+        }
+
         private static Vector3 EvaluateGuidedLocalWaypoint(float normT, bool isRight)
         {
             float s = isRight ? 1f : -1f;
-            Vector3 p0 = new Vector3(0.08f * s, -0.18f, 0.34f); // Stage 1: Center Chest Midline
-            Vector3 p1 = new Vector3(0.14f * s, -0.14f, 0.50f); // Stage 2: Forward Reach (+Z)
-            Vector3 p2 = new Vector3(0.26f * s, 0.02f, 0.42f);  // Stage 3: High Lateral Reach (+Y, +-X)
-            Vector3 p3 = new Vector3(0.12f * s, -0.28f, 0.38f); // Stage 4: Low Sweep (-Y)
-            Vector3 p4 = new Vector3(0.08f * s, -0.18f, 0.36f); // Stage 5: Return to Center Handle
+            Vector3 p0 = new Vector3(0.08f * s, -0.18f, 0.34f);
+            Vector3 p1 = new Vector3(0.14f * s, -0.14f, 0.50f);
+            Vector3 p2 = new Vector3(0.26f * s, 0.02f, 0.42f);
+            Vector3 p3 = new Vector3(0.12f * s, -0.28f, 0.38f);
+            Vector3 p4 = new Vector3(0.08f * s, -0.18f, 0.36f);
 
             if (normT <= 0.20f)
             {
@@ -488,7 +706,6 @@ namespace PsychophysicsVR.Tracking
             }
             if (normT <= 0.85f)
             {
-                // Stage 5: Smooth Figure-8 / Arc Sweep across X/Y/Z before returning to center
                 float seg = (normT - 0.60f) / 0.25f;
                 float u = Mathf.SmoothStep(0f, 1f, seg);
                 Vector3 basePos = Vector3.Lerp(p3, p4, u);
@@ -498,7 +715,6 @@ namespace PsychophysicsVR.Tracking
                 basePos.z += 0.05f * Mathf.Sin(seg * Mathf.PI);
                 return basePos;
             }
-            // Final settle pause at center handle (captures zero-velocity final IMU orientation)
             return p4;
         }
 
@@ -663,8 +879,69 @@ namespace PsychophysicsVR.Tracking
         private ControllerState ReadControllerState(bool isLeft)
         {
             ControllerState state = default;
+
+#if ENABLE_INPUT_SYSTEM
+            // 1. Explicit OpenXR InputActions (highest reliability in Unity 6 / OpenXR)
+            HandInputActions actions = isLeft ? _leftActions : _rightActions;
+            if (actions != null)
+            {
+                Vector3 actPos = actions.PosAction.ReadValue<Vector3>();
+                Quaternion actRot = actions.RotAction.ReadValue<Quaternion>();
+                if (actRot.x == 0f && actRot.y == 0f && actRot.z == 0f && actRot.w == 0f)
+                    actRot = Quaternion.identity;
+
+                if (actPos.sqrMagnitude > 0.0001f)
+                {
+                    state.Tracked = true;
+                    TransformLocalPoseToWorld(actPos, actRot, out state.WorldPos, out state.WorldRot);
+                    state.Primary = actions.PrimaryAction.IsPressed();
+                    state.Secondary = actions.SecondaryAction.IsPressed();
+                    state.Grip = actions.GripAction.IsPressed();
+                    state.Trigger = actions.TriggerAction.IsPressed();
+                    state.Stick = actions.StickAction.ReadValue<Vector2>();
+                    return state;
+                }
+            }
+
+            // 2. Fallback: InputSystem XRController device
+            XRController xrCtrl = isLeft ? XRController.leftHand : XRController.rightHand;
+            if (xrCtrl != null && xrCtrl.added)
+            {
+                bool trackedCtrl = xrCtrl.isTracked != null && xrCtrl.isTracked.isPressed;
+                Vector3 localPos = xrCtrl.devicePosition != null ? xrCtrl.devicePosition.ReadValue() : Vector3.zero;
+                Quaternion localRot = xrCtrl.deviceRotation != null ? xrCtrl.deviceRotation.ReadValue() : Quaternion.identity;
+                if (localPos.sqrMagnitude < 0.0001f)
+                {
+                    Vector3Control ptrPos = xrCtrl.TryGetChildControl<Vector3Control>("pointerPosition");
+                    if (ptrPos != null) localPos = ptrPos.ReadValue();
+                }
+
+                if (trackedCtrl || localPos.sqrMagnitude > 0.0001f)
+                {
+                    state.Tracked = true;
+                    TransformLocalPoseToWorld(localPos, localRot, out state.WorldPos, out state.WorldRot);
+                    state.Primary = ReadInputSystemButton(xrCtrl, "primaryButton");
+                    state.Secondary = ReadInputSystemButton(xrCtrl, "secondaryButton");
+                    state.Grip = ReadInputSystemButton(xrCtrl, "gripPressed");
+                    state.Trigger = ReadInputSystemButton(xrCtrl, "triggerPressed");
+
+                    StickControl stickCtrl = xrCtrl.TryGetChildControl<StickControl>("thumbstick");
+                    if (stickCtrl != null) state.Stick = stickCtrl.ReadValue();
+                    return state;
+                }
+            }
+#endif
+
+            // 3. Fallback: UnityEngine.XR.InputDevices (XRNode + Characteristics scan)
             XRNode node = isLeft ? XRNode.LeftHand : XRNode.RightHand;
             UnityEngine.XR.InputDevice dev = InputDevices.GetDeviceAtXRNode(node);
+            if (!dev.isValid)
+            {
+                InputDeviceCharacteristics sideChar = isLeft ? InputDeviceCharacteristics.Left : InputDeviceCharacteristics.Right;
+                _xrDeviceCache.Clear();
+                InputDevices.GetDevicesWithCharacteristics(InputDeviceCharacteristics.Controller | sideChar, _xrDeviceCache);
+                if (_xrDeviceCache.Count > 0) dev = _xrDeviceCache[0];
+            }
 
             if (dev.isValid)
             {
@@ -681,32 +958,9 @@ namespace PsychophysicsVR.Tracking
                     state.Grip = GetBoolUsage(dev, UnityEngine.XR.CommonUsages.gripButton);
                     state.Trigger = GetBoolUsage(dev, UnityEngine.XR.CommonUsages.triggerButton);
                     state.Stick = GetVec2Usage(dev, UnityEngine.XR.CommonUsages.primary2DAxis);
-                    return state;
                 }
             }
 
-#if ENABLE_INPUT_SYSTEM
-            XRController xrCtrl = isLeft ? XRController.leftHand : XRController.rightHand;
-            if (xrCtrl != null && xrCtrl.added)
-            {
-                bool trackedCtrl = xrCtrl.isTracked != null && xrCtrl.isTracked.isPressed;
-                Vector3 localPos = xrCtrl.devicePosition != null ? xrCtrl.devicePosition.ReadValue() : Vector3.zero;
-                Quaternion localRot = xrCtrl.deviceRotation != null ? xrCtrl.deviceRotation.ReadValue() : Quaternion.identity;
-
-                if (trackedCtrl || localPos.sqrMagnitude > 0.0001f)
-                {
-                    state.Tracked = true;
-                    TransformLocalPoseToWorld(localPos, localRot, out state.WorldPos, out state.WorldRot);
-                    state.Primary = ReadInputSystemButton(xrCtrl, "primaryButton");
-                    state.Secondary = ReadInputSystemButton(xrCtrl, "secondaryButton");
-                    state.Grip = ReadInputSystemButton(xrCtrl, "gripPressed");
-                    state.Trigger = ReadInputSystemButton(xrCtrl, "triggerPressed");
-
-                    StickControl stickCtrl = xrCtrl.TryGetChildControl<StickControl>("thumbstick");
-                    if (stickCtrl != null) state.Stick = stickCtrl.ReadValue();
-                }
-            }
-#endif
             return state;
         }
 
@@ -805,7 +1059,7 @@ namespace PsychophysicsVR.Tracking
             {
                 string fStr = receiver.handFingersTracked ? "21-Fingers: ON" : "Arm Tracking";
                 string ctrlStr = _anyControllerTracked ? "VR Ctrl: ON" : "Gaze Mode (3s Hold)";
-                _headerText.text = $"PIMAX + D455C v6.2  |  {fStr}  |  {ctrlStr}";
+                _headerText.text = $"PIMAX + D455C v6.3  |  {fStr}  |  {ctrlStr}";
             }
             if (_statusText != null && controller != null)
             {
@@ -857,6 +1111,18 @@ namespace PsychophysicsVR.Tracking
 
             _rightPathPreviewLine = CreatePathPreviewLine("RightGuidedPathLine", new Color(0.2f, 0.85f, 1.0f, 0.5f));
             _leftPathPreviewLine = CreatePathPreviewLine("LeftGuidedPathLine", new Color(1.0f, 0.72f, 0.2f, 0.5f));
+
+            _rightTetherLine = CreatePathPreviewLine("RightTetherLine", Color.yellow);
+            _rightTetherLine.startWidth = 0.008f;
+            _rightTetherLine.endWidth = 0.004f;
+            _rightTetherLine.positionCount = 2;
+            _rightTetherLine.enabled = false;
+
+            _leftTetherLine = CreatePathPreviewLine("LeftTetherLine", Color.yellow);
+            _leftTetherLine.startWidth = 0.008f;
+            _leftTetherLine.endWidth = 0.004f;
+            _leftTetherLine.positionCount = 2;
+            _leftTetherLine.enabled = false;
         }
 
         private LineRenderer CreatePathPreviewLine(string name, Color color)
@@ -885,12 +1151,10 @@ namespace PsychophysicsVR.Tracking
             _headerText = CreateWorldText(_boardRoot.transform, "HeaderText", new Vector3(0f, 0.240f, -0.008f), 40, Color.cyan);
             _statusText = CreateWorldText(_boardRoot.transform, "StatusText", new Vector3(0f, 0.192f, -0.008f), 28, new Color(0.85f, 0.92f, 1.0f));
 
-            // Featured Top Row: Full 3D Guided 8s Path Calibration!
             CreateVRButton(new Vector3(0.0f, 0.130f, -0.010f), new Vector2(0.54f, 0.048f),
                 new Color(0.14f, 0.62f, 0.42f), () => "GUIDED 8s 3D PATH CALIBRATION (All Axes + Both Arms)",
                 () => StartGuidedPathCalibrationPrompt());
 
-            // Row 2: Quick Snapshot Calibrations
             CreateVRButton(new Vector3(-0.14f, 0.074f, -0.010f), new Vector2(0.26f, 0.044f),
                 new Color(0.12f, 0.48f, 0.72f), () => "Quick Camera Snap (C)",
                 () => controller?.PerformOneClickCalibration());
@@ -899,7 +1163,6 @@ namespace PsychophysicsVR.Tracking
                 new Color(0.16f, 0.52f, 0.56f), () => "Quick Match Ctrl (Grip+Trig)",
                 () => TryCalibrateWithActiveController());
 
-            // Row 3: Auto-Align & Experiment Task
             CreateVRButton(new Vector3(-0.14f, 0.018f, -0.010f), new Vector2(0.26f, 0.044f),
                 new Color(0.22f, 0.44f, 0.56f),
                 () => $"Auto-Align: {(receiver != null && receiver.continuousAutoCalibration ? "ON" : "OFF")}",
@@ -910,7 +1173,6 @@ namespace PsychophysicsVR.Tracking
                 () => $"Task: {(controller != null ? controller.experimentPreset.ToString() : "General")}",
                 () => controller?.CycleExperimentPreset());
 
-            // Row 4: Arm Mode & 3D Mesh Style
             CreateVRButton(new Vector3(-0.14f, -0.038f, -0.010f), new Vector2(0.26f, 0.044f),
                 new Color(0.62f, 0.48f, 0.14f),
                 () => $"Arm: {(controller != null ? controller.activeArmMode.ToString() : "Right")}",
@@ -921,7 +1183,6 @@ namespace PsychophysicsVR.Tracking
                 () => $"Mesh: {(controller != null ? controller.handVisualStyle.ToString() : "Microsoft")}",
                 () => controller?.CycleVisualStyle());
 
-            // Row 5: PD Controller Frequency (Smoothness)
             CreateVRButton(new Vector3(-0.20f, -0.094f, -0.010f), new Vector2(0.12f, 0.040f),
                 new Color(0.25f, 0.30f, 0.40f), () => "PD -",
                 () => { if (controller != null) controller.pdNaturalFrequencyHz = Mathf.Max(1.5f, controller.pdNaturalFrequencyHz - 0.5f); });
@@ -934,7 +1195,6 @@ namespace PsychophysicsVR.Tracking
                 new Color(0.25f, 0.30f, 0.40f), () => "PD +",
                 () => { if (controller != null) controller.pdNaturalFrequencyHz = Mathf.Min(12.0f, controller.pdNaturalFrequencyHz + 0.5f); });
 
-            // Row 6: Psychophysics Movement Gain
             CreateVRButton(new Vector3(-0.20f, -0.144f, -0.010f), new Vector2(0.12f, 0.040f),
                 new Color(0.25f, 0.30f, 0.40f), () => "Gain -",
                 () => { if (controller != null) controller.movementGain = Mathf.Max(0.2f, controller.movementGain - 0.1f); });
@@ -947,7 +1207,6 @@ namespace PsychophysicsVR.Tracking
                 new Color(0.25f, 0.30f, 0.40f), () => "Gain +",
                 () => { if (controller != null) controller.movementGain = Mathf.Min(2.5f, controller.movementGain + 0.1f); });
 
-            // Row 7: Shoulder Height & Save
             CreateVRButton(new Vector3(-0.20f, -0.194f, -0.010f), new Vector2(0.12f, 0.040f),
                 new Color(0.25f, 0.30f, 0.40f), () => "Sh.Y -",
                 () => { if (controller != null) controller.shoulderOffsetFromHead.y = Mathf.Max(-0.35f, controller.shoulderOffsetFromHead.y - 0.02f); });
@@ -961,12 +1220,10 @@ namespace PsychophysicsVR.Tracking
                 new Color(0.25f, 0.30f, 0.40f), () => "Sh.Y +",
                 () => { if (controller != null) controller.shoulderOffsetFromHead.y = Mathf.Min(0.05f, controller.shoulderOffsetFromHead.y + 0.02f); });
 
-            // Row 8: Hide Menu button
             CreateVRButton(new Vector3(0.0f, -0.240f, -0.010f), new Vector2(0.38f, 0.036f),
                 new Color(0.55f, 0.22f, 0.22f), () => "Hide VR Menu (A/X, Tab, or 3s Gaze)",
                 () => ToggleVRDashboard());
 
-            // Laser Pointer LineRenderer + Gaze/Cursor Reticle Dot
             GameObject laserGo = new GameObject("VRLaserPointer");
             laserGo.transform.SetParent(this.transform, false);
             _laserLine = laserGo.AddComponent<LineRenderer>();
@@ -995,15 +1252,15 @@ namespace PsychophysicsVR.Tracking
         {
             if (controller == null) return;
             ControllerState right = ReadControllerState(isLeft: false);
-            if (right.Tracked)
+            if (right.Tracked || _hasCachedRight)
             {
-                controller.CalibrateToVRController(right.WorldPos, right.WorldRot, false);
+                controller.CalibrateToVRController(right.Tracked ? right.WorldPos : _cachedRightPos, right.Tracked ? right.WorldRot : _cachedRightRot, false);
                 return;
             }
             ControllerState left = ReadControllerState(isLeft: true);
-            if (left.Tracked)
+            if (left.Tracked || _hasCachedLeft)
             {
-                controller.CalibrateToVRController(left.WorldPos, left.WorldRot, true);
+                controller.CalibrateToVRController(left.Tracked ? left.WorldPos : _cachedLeftPos, left.Tracked ? left.WorldRot : _cachedLeftRot, true);
                 return;
             }
             controller.PerformOneClickCalibration();
